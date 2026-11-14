@@ -5,7 +5,7 @@
 ```text
 src/inference_server/
   __init__.py
-  model.py        # Model/tokenizer loading, device selection, sync_gpu()
+  model.py        # Explicit BF16 GPU loading and sync_gpu()
   generation.py   # Prompt preparation, sampling, generation, and metrics
   server.py       # Request/response types and FastAPI endpoints
 tests/
@@ -15,70 +15,77 @@ pyproject.toml   # Dependencies and package installation
 PLAN.md          # Later iterations
 ```
 
+## Runpod image
+
+Use a Runpod GPU Pod with this PyTorch image **PyTorch 2.9.1, CUDA 12.8.1, and Ubuntu 24.04**
+
+Choose one BF16-capable GPU and a host compatible with the image's CUDA version.
+
+Add **8000** to the Pod's exposed HTTP ports. The steps below run in the Pod's
+Linux terminal.
+
 ## Install
 
-Use Python 3.11 or later. From the repo folder, in PowerShell:
+Clone or upload this repo to `/workspace/llm-inference-02-inference-server`, then:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
+```bash
+cd /workspace/llm-inference-02-inference-server
+python -m pip install -e . 
 ```
 
-`-e` installs the package in editable mode, so edits inside `src/` take effect
-without reinstalling it. Dependencies are listed in `pyproject.toml`.
+Check the environment before loading the model:
 
-The loading settings are copied from the notebook: `Qwen/Qwen3-4B`, BF16, and
-`device_map="auto"`. Use the same hardware setup that runs your notebook. For CUDA,
-make sure your PyTorch installation supports your GPU.
+```bash
+python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0))"
+```
 
-Importing `model.py` loads the model. The first run downloads weights if they are
-not already cached. The server, local benchmark, and smoke test each load their
-own model; run them one at a time. The HTTP benchmark uses the running server's
-model.
+The server, local benchmark, and GPU smoke test each load their own model; run
+them one at a time. The HTTP benchmark uses the running server's model.
 
 ## Start the server
 
-```powershell
-python -m uvicorn inference_server.server:app --workers 1
+```bash
+python -m uvicorn inference_server.server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-The API is at `http://127.0.0.1:8000`. Interactive request examples are available
-at `http://127.0.0.1:8000/docs`.
+Inside the Pod, the API is at `http://127.0.0.1:8000`. From your browser, open
+`https://POD_ID-8000.proxy.runpod.net/docs`, replacing `POD_ID` with your Pod's ID.
+Binding to `0.0.0.0` makes the server reachable through Runpod's proxy.
 
-Try a request from another PowerShell window:
+Try a request from another terminal in the same Pod:
 
-```powershell
-$body = @{ prompt = "Explain KV caching"; max_new_tokens = 32 } | ConvertTo-Json
-Invoke-RestMethod http://127.0.0.1:8000/generate -Method Post -ContentType application/json -Body $body
+```bash
+curl http://127.0.0.1:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Explain KV caching","max_new_tokens":32}'
 ```
 
-The endpoints are `GET /health`, `POST /generate`, and `POST /stream`. To try
-streaming, save a request to a file and use curl:
+The endpoints are `GET /health`, `POST /generate`, and `POST /stream`. To try streaming:
 
-```powershell
-'{"prompt":"Say hello","max_new_tokens":16}' | Set-Content -Encoding Ascii request.json
-curl.exe -N http://127.0.0.1:8000/stream -H "Content-Type: application/json" --data-binary "@request.json"
+```bash
+curl -N http://127.0.0.1:8000/stream \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Say hello","max_new_tokens":16}'
 ```
 
 ## Run the existing checks
 
 These commands run their own model and do not need a running HTTP server:
 
-```powershell
+```bash
 python tests/test_server.py
 python benchmark.py
 ```
 
 The smoke test checks health and generation. The benchmark warms up the model,
 compares cached and uncached generation, and prints whether their token IDs match.
-Both commands need the real model and enough memory to load it.
+Both commands need the real model and enough GPU memory to load it.
 
 ## Measure concurrent HTTP requests
 
 Start the server in one terminal, then run this in another:
 
-```powershell
+```bash
 python benchmark.py --http
 ```
 
@@ -106,17 +113,15 @@ and printing. You can change `SERVER_URL`, `REQUEST_COUNT`, or `MAX_NEW_TOKENS`
 near the top of the file. Repeat the experiment a few times on the same hardware
 and keep the printed summaries for comparison with later iterations.
 
-Benchmark checks that do not load model weights can be run with:
+Unit checks use mocked CUDA calls and a tiny locally created model. They require
+no GPU or pretrained weight downloads:
 
-```powershell
-python -m unittest discover -s tests -p test_benchmark.py -v
+```bash
+python -m unittest discover -s tests -v
 ```
 
 ## Existing behavior to revisit later
 
-- `/stream` always uses KV caching, including when `use_cache=false` is supplied.
+- `/stream` always uses KV caching, including when `use_kv_cache=false` is supplied.
 - The cached and streaming loops run an unused model forward after the last token
   when they reach the output limit without hitting EOS.
-
-These are carried over from the notebook. Queuing, scheduling, and batching are
-covered by later iterations in [PLAN.md](PLAN.md).

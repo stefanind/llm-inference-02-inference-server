@@ -16,18 +16,25 @@ MAX_NEW_TOKENS = 32
 
 def run_local_benchmark():
     """Run the original cached/uncached comparison directly on the model."""
-    # Importing generation loads the model. Keep this inside the local mode so
-    # HTTP mode can use the server without loading a second model.
+    # Keep model-related imports in local mode so HTTP mode needs only httpx.
     from inference_server.generation import (
         generate_cached,
         generate_uncached,
         summarize_result,
     )
+    from inference_server.model import load_model
 
-    generate_cached("Say hello in one sentence.", max_new_tokens=2)
+    model, tokenizer = load_model()
+    generate_cached(
+        "Say hello in one sentence.", model=model, tokenizer=tokenizer, max_new_tokens=2
+    )
 
-    uncached_result = generate_uncached(BENCHMARK_PROMPT, max_new_tokens=24)
-    cached_result = generate_cached(BENCHMARK_PROMPT, max_new_tokens=24)
+    uncached_result = generate_uncached(
+        BENCHMARK_PROMPT, model=model, tokenizer=tokenizer, max_new_tokens=24
+    )
+    cached_result = generate_cached(
+        BENCHMARK_PROMPT, model=model, tokenizer=tokenizer, max_new_tokens=24
+    )
 
     return {
         "outputs_match": uncached_result["token_ids"] == cached_result["token_ids"],
@@ -42,7 +49,7 @@ def send_request(client, prompt):
         "prompt": prompt,
         "max_new_tokens": MAX_NEW_TOKENS,
         "temperature": 0.0,
-        "use_cache": True,
+        "use_kv_cache": True,
     }
 
     started_at = time.perf_counter()

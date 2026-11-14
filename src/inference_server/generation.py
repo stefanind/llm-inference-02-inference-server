@@ -5,10 +5,10 @@ from typing import Optional
 
 import torch
 
-from inference_server.model import model, tokenizer, sync_gpu
+from inference_server.model import sync_gpu
 
 
-def prepare_inputs(prompt: str):
+def prepare_inputs(prompt: str, model, tokenizer):
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt}
@@ -52,17 +52,19 @@ def select_next_token(
 @torch.inference_mode()
 def generate_uncached(
     prompt: str,
+    model,
+    tokenizer,
     max_new_tokens: int = 32,
     temperature: float = 0.0,
     top_k: Optional[int] = None,
 ) -> dict:
-    inputs = prepare_inputs(prompt)
+    inputs = prepare_inputs(prompt, model, tokenizer)
     generated_ids = inputs["input_ids"] # B, S
     attention_mask = inputs["attention_mask"] # B, S
     prompt_length = generated_ids.shape[1]
     first_token_at = None
 
-    sync_gpu()
+    sync_gpu(model.device)
     started_at = time.perf_counter()
     for _ in range(max_new_tokens):
         outputs = model(
@@ -77,7 +79,7 @@ def generate_uncached(
             top_k,
         )
         if first_token_at is None:
-            sync_gpu()
+            sync_gpu(model.device)
             first_token_at = time.perf_counter() # ttft
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -85,7 +87,7 @@ def generate_uncached(
         if next_token.item() == tokenizer.eos_token_id:
             break
 
-    sync_gpu()
+    sync_gpu(model.device)
     finished_at = time.perf_counter()
     completion_ids = generated_ids[0, prompt_length:]
     return {
@@ -100,17 +102,19 @@ def generate_uncached(
 @torch.inference_mode()
 def generate_cached(
     prompt: str,
+    model,
+    tokenizer,
     max_new_tokens: int = 32,
     temperature: float = 0.0,
     top_k: Optional[int] = None,
 ) -> dict:
-    inputs = prepare_inputs(prompt)
+    inputs = prepare_inputs(prompt, model, tokenizer)
     generated_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
     prompt_length = generated_ids.shape[1]
     first_token_at = None
 
-    sync_gpu()
+    sync_gpu(model.device)
     started_at = time.perf_counter()
     # prefill
     outputs = model(
@@ -129,7 +133,7 @@ def generate_cached(
         )
         assert next_token is not None, "Select the next token"
         if first_token_at is None:
-            sync_gpu()
+            sync_gpu(model.device)
             first_token_at = time.perf_counter()
 
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
@@ -151,7 +155,7 @@ def generate_cached(
         )
         past_key_values = outputs.past_key_values
 
-    sync_gpu()
+    sync_gpu(model.device)
     finished_at = time.perf_counter()
     completion_ids = generated_ids[0, prompt_length:]
     return {
@@ -200,11 +204,13 @@ def summarize_result(result: dict, used_kv_cache: bool) -> dict:
 @torch.inference_mode()
 def generate_stream(
     prompt: str,
+    model,
+    tokenizer,
     max_new_tokens: int = 32,
     temperature: float = 0.0,
     top_k: Optional[int] = None,
 ):
-    inputs = prepare_inputs(prompt)
+    inputs = prepare_inputs(prompt, model, tokenizer)
     generated_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
     prompt_length = generated_ids.shape[1]
