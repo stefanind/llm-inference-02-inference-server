@@ -1,0 +1,38 @@
+{
+  "results": [
+    {
+      "request_id": "W1-u1-r1",
+      "user_id": 1,
+      "scheduled_arrival_ms": 0,
+      "actual_arrival_ms": 0.1297999988310039,
+      "success": true,
+      "status_code": 200,
+      "text": "Simulated response: Request W1-u1-r1",
+      "output_tokens": null,
+      "ttft_ms": null,
+      "queue_wait_ms": 0.014999997802078724,
+      "latency_ms": 2021.415800030809
+    }
+  ],
+  "summary": {
+    "total_requests": 1,
+    "successful_requests": 1,
+    "failed_requests": 0,
+    "rejected_requests": 0,
+    "timed_out_requests": 0,
+    "other_error_requests": 0,
+    "error_rate_percent": 0.0,
+    "requests_per_second": 0.4946673132229216,
+    "average_latency_ms": 2021.415800030809,
+    "p50_latency_ms": 2021.415800030809,
+    "p95_latency_ms": 2021.415800030809,
+    "average_generation_ttft_ms": null,
+    "average_queue_wait_ms": 0.014999997802078724,
+    "p50_queue_wait_ms": 0.014999997802078724,
+    "p95_queue_wait_ms": 0.014999997802078724,
+    "elapsed_seconds": 2.0215607000282034,
+    "total_output_tokens": null,
+    "output_tokens_per_second": null,
+    "errors": []
+  }
+}
