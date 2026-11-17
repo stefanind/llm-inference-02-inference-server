@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from inference_server.engine import run_worker, submit_request
+from inference_server.engine import run_continuous_worker, run_worker, submit_request
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
@@ -26,6 +26,7 @@ class GenerateResponse(BaseModel):
     output_tokens: int = Field(ge=0)
     output_tokens_per_second: float = Field(ge=0)
     used_kv_cache: bool = True
+    scheduler: str = "fixed"
 
 
 async def simulate_inference(prompts, delay_seconds=2.0):
@@ -34,7 +35,24 @@ async def simulate_inference(prompts, delay_seconds=2.0):
     return [f"Simulated response: {prompt}" for prompt in prompts]
 
 
-def create_app(mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4, batch_wait_ms=10):
+async def simulate_step(active, delay_seconds=0.01):
+    """Advance each request by one dummy step; these are not real model tokens."""
+    await asyncio.sleep(delay_seconds)
+    for job in active:
+        job.steps_completed += 1
+        if job.steps_completed >= job.request.max_new_tokens:
+            job.response = {
+                "text": f"Simulated response: {job.request.prompt}",
+                "mode": "simulated",
+                "scheduler": "continuous",
+                "simulated_steps": job.steps_completed,
+            }
+
+
+def create_app(
+    mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4,
+    batch_wait_ms=10, scheduler="fixed", step_delay_seconds=0.01,
+):
     """Build the same HTTP routes with either simulated or real inference."""
     if mode not in ["simulated", "real"]:
         raise ValueError("mode must be simulated or real")
@@ -46,6 +64,10 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4, 
         raise ValueError("batch_size must be positive")
     if not math.isfinite(batch_wait_ms) or batch_wait_ms < 0:
         raise ValueError("batch_wait_ms must be finite and nonnegative")
+    if scheduler not in ["fixed", "continuous"]:
+        raise ValueError("scheduler must be fixed or continuous")
+    if not math.isfinite(step_delay_seconds) or step_delay_seconds < 0:
+        raise ValueError("step_delay_seconds must be finite and nonnegative")
 
     def generate_real(requests):
         # These imports happen only when real inference is requested.
@@ -56,11 +78,20 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4, 
     async def generate(requests):
         if mode == "simulated":
             texts = await simulate_inference([request.prompt for request in requests], delay_seconds)
-            return [{"text": text, "mode": "simulated"} for text in texts]
+            return [{"text": text, "mode": "simulated", "scheduler": "fixed"} for text in texts]
         # GPU calls block. Move the whole call to a thread so the event loop can
         # still accept requests, reject a full queue, and answer health checks.
         # The worker awaits this call, so only one batch runs at a time.
         return await asyncio.to_thread(generate_real, requests)
+
+    async def step(active):
+        if mode == "simulated":
+            await simulate_step(active, step_delay_seconds)
+        else:
+            from inference_server.generation import generate_step
+
+            # The worker awaits one whole token step before changing membership.
+            await asyncio.to_thread(generate_step, active, app.state.model, app.state.tokenizer)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -69,9 +100,14 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4, 
             from inference_server.model import load_model
 
             app.state.model, app.state.tokenizer = load_model()
-        # Capacity counts queued requests; the worker can also hold one batch.
+        # Capacity counts queued requests; active slots are held by the worker.
         app.state.queue = asyncio.Queue(maxsize=queue_capacity)
-        worker = asyncio.create_task(run_worker(app.state.queue, generate, batch_size, batch_wait_ms))
+        if scheduler == "continuous":
+            worker = asyncio.create_task(run_continuous_worker(
+                app.state.queue, step, batch_size, batch_wait_ms,
+            ))
+        else:
+            worker = asyncio.create_task(run_worker(app.state.queue, generate, batch_size, batch_wait_ms))
         try:
             yield
         finally:

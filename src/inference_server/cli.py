@@ -19,7 +19,7 @@ def main():
     )
     parser.add_argument(
         "--delay", type=float, default=2.0,
-        help="Seconds to wait per simulated request (default: 2)",
+        help="Seconds per simulated fixed batch (default: 2)",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Address to listen on")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
@@ -29,6 +29,14 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=4, help="Maximum requests per batch (default: 4)")
     parser.add_argument("--batch-wait-ms", type=float, default=10, help="Batch collection window in ms (default: 10)")
+    parser.add_argument(
+        "--scheduler", choices=["fixed", "continuous"], default="fixed",
+        help="Scheduling mode (default: fixed)",
+    )
+    parser.add_argument(
+        "--step-delay", type=float, default=0.01,
+        help="Seconds per simulated continuous decode step (default: 0.01)",
+    )
 
     commands = parser.add_subparsers(dest="command")
     run_parser = commands.add_parser("run", help="Submit a workload and print its JSON report")
@@ -75,6 +83,7 @@ def main():
         app = create_app(
             mode=args.mode, delay_seconds=args.delay, queue_capacity=args.queue_capacity,
             batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
+            scheduler=args.scheduler, step_delay_seconds=args.step_delay,
         )
     except ValueError as error:
         parser.error(str(error))

@@ -19,7 +19,10 @@ execution begins, including batch collection. It excludes network and HTTP-frame
 waiting. Queue
 summaries cover successful responses only and stay None if any lacks this field.
 Rejected requests never entered the queue and have no queue-wait measurement.
-batch_size is the number of requests at dispatch, not a per-token active count.
+batch_size is the number of requests at dispatch, or at the first decode step
+for continuous scheduling. Membership can change on later steps.
+simulated_steps counts dummy steps, not model tokens. It must not be used to
+calculate output_tokens_per_second or generation TTFT.
 """
 
 

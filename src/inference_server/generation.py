@@ -261,6 +261,68 @@ def generate_batch(requests, model, tokenizer) -> list[dict]:
     return results
 
 
+@torch.inference_mode()
+def generate_step(active, model, tokenizer):
+    """Advance every active request by one real token in one batched forward.
+
+    Recompute prefixes without a KV cache so rows can join and leave freely.
+    Generation timing starts when this backend first initializes each request.
+    """
+    sequences = []
+    for job in active:
+        if job.prompt_token_ids is None:
+            job.generation_started_at = time.perf_counter()
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": job.request.prompt},
+            ]
+            job.prompt_token_ids = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, enable_thinking=False,
+                return_dict=False,
+            )
+        sequences.append(job.prompt_token_ids + job.token_ids)
+
+    # Membership and sequence lengths can change on every step. Left padding
+    # puts each request's last real token at the end of its row.
+    width = max(len(sequence) for sequence in sequences)
+    input_ids = []
+    masks = []
+    for sequence in sequences:
+        padding = width - len(sequence)
+        input_ids.append([tokenizer.pad_token_id] * padding + sequence)
+        masks.append([0] * padding + [1] * len(sequence))
+    input_ids = torch.tensor(input_ids, dtype=torch.long, device=model.device)
+    attention_mask = torch.tensor(masks, dtype=torch.long, device=model.device)
+    position_ids = attention_mask.cumsum(dim=1) - 1
+    position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=False,
+    )
+
+    for index, job in enumerate(active):
+        token = select_next_token(
+            outputs.logits[index:index + 1, -1, :], job.request.temperature, job.request.top_k,
+        ).item()
+        job.token_ids.append(token)
+        job.steps_completed += 1
+        ready_at = time.perf_counter()
+        if job.first_token_at is None:
+            job.first_token_at = ready_at
+        if token == tokenizer.eos_token_id or len(job.token_ids) >= job.request.max_new_tokens:
+            result = {
+                "text": tokenizer.decode(job.token_ids, skip_special_tokens=True),
+                "token_ids": job.token_ids,
+                "input_tokens": len(job.prompt_token_ids),
+                "ttft_ms": (job.first_token_at - job.generation_started_at) * 1000,
+                "latency_ms": (ready_at - job.generation_started_at) * 1000,
+            }
+            job.response = summarize_result(result, used_kv_cache=False)
+            job.response["scheduler"] = "continuous"
+
+
 def summarize_result(result: dict, used_kv_cache: bool) -> dict:
 
     output_tokens = len(result['token_ids'])
