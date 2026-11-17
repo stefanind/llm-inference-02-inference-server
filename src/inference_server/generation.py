@@ -167,6 +167,100 @@ def generate_cached(
     }
 
 
+@torch.inference_mode()
+def generate_batch(requests, model, tokenizer) -> list[dict]:
+    """Run one fixed batch. Finished rows stay padded until every request ends."""
+    conversations = []
+    for request in requests:
+        conversations.append([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": request.prompt},
+        ])
+    inputs = tokenizer.apply_chat_template(
+        conversations,
+        add_generation_prompt=True,
+        enable_thinking=False,
+        padding=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    generated_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
+    prompt_lengths = attention_mask.sum(dim=1).tolist()
+
+    # A model forward has one cache setting. If anyone opts out, the entire
+    # batch runs uncached; used_kv_cache reports what actually happened.
+    use_kv_cache = all(request.use_kv_cache for request in requests)
+    past_key_values = None
+    token_ids = [[] for _ in requests]
+    first_token_at = [None] * len(requests)
+    finished_at = [None] * len(requests)
+    finished = [False] * len(requests)
+
+    sync_gpu(model.device)
+    started_at = time.perf_counter()
+    for _ in range(max(request.max_new_tokens for request in requests)):
+        # Padding must not change a prompt's token positions. The mask gives
+        # real tokens positions 0, 1, 2, ... independently for each row.
+        position_ids = attention_mask.cumsum(dim=1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+        input_ids = generated_ids
+        if use_kv_cache and past_key_values is not None:
+            input_ids = generated_ids[:, -1:]
+            position_ids = position_ids[:, -1:]
+
+        # One forward processes all rows together: prefill first, then decode.
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_kv_cache,
+        )
+        if use_kv_cache:
+            past_key_values = outputs.past_key_values
+
+        next_tokens = torch.full(
+            (len(requests), 1), tokenizer.pad_token_id,
+            dtype=generated_ids.dtype, device=model.device,
+        )
+        next_mask = torch.zeros_like(next_tokens)
+        for index, request in enumerate(requests):
+            if finished[index]:
+                continue
+            # Sampling settings and output limits belong to each request.
+            token = select_next_token(
+                outputs.logits[index:index + 1, -1, :], request.temperature, request.top_k,
+            )
+            next_tokens[index] = token[0]
+            next_mask[index] = 1
+            token_id = token.item()
+            token_ids[index].append(token_id)
+            ready_at = time.perf_counter()
+            if first_token_at[index] is None:
+                first_token_at[index] = ready_at
+            if token_id == tokenizer.eos_token_id or len(token_ids[index]) == request.max_new_tokens:
+                finished[index] = True
+                finished_at[index] = ready_at
+
+        if all(finished):
+            break
+        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
+        attention_mask = torch.cat([attention_mask, next_mask], dim=1)
+
+    results = []
+    for index in range(len(requests)):
+        result = {
+            "text": tokenizer.decode(token_ids[index], skip_special_tokens=True),
+            "token_ids": token_ids[index],
+            "input_tokens": prompt_lengths[index],
+            "ttft_ms": (first_token_at[index] - started_at) * 1000,
+            "latency_ms": (finished_at[index] - started_at) * 1000,
+        }
+        results.append(summarize_result(result, used_kv_cache=use_kv_cache))
+    return results
+
+
 def summarize_result(result: dict, used_kv_cache: bool) -> dict:
 
     output_tokens = len(result['token_ids'])

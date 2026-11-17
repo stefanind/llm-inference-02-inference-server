@@ -19,6 +19,7 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     text: str
     queue_wait_ms: float = Field(ge=0)
+    batch_size: int = Field(ge=1)
     ttft_ms: float = Field(ge=0)
     latency_ms: float = Field(ge=0)
     input_tokens: int = Field(ge=0)
@@ -27,13 +28,13 @@ class GenerateResponse(BaseModel):
     used_kv_cache: bool = True
 
 
-async def simulate_inference(prompt, delay_seconds=2.0):
-    """Wait without blocking the event loop, then return a recognizable reply."""
+async def simulate_inference(prompts, delay_seconds=2.0):
+    """Wait once for the whole batch, then return one recognizable reply per prompt."""
     await asyncio.sleep(delay_seconds)
-    return f"Simulated response: {prompt}"
+    return [f"Simulated response: {prompt}" for prompt in prompts]
 
 
-def create_app(mode="real", delay_seconds=2.0, queue_capacity=20):
+def create_app(mode="real", delay_seconds=2.0, queue_capacity=20, batch_size=4, batch_wait_ms=10):
     """Build the same HTTP routes with either simulated or real inference."""
     if mode not in ["simulated", "real"]:
         raise ValueError("mode must be simulated or real")
@@ -41,35 +42,25 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20):
         raise ValueError("delay must be a finite, nonnegative number of seconds")
     if queue_capacity <= 0:
         raise ValueError("queue_capacity must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if not math.isfinite(batch_wait_ms) or batch_wait_ms < 0:
+        raise ValueError("batch_wait_ms must be finite and nonnegative")
 
-    def generate_real(request):
+    def generate_real(requests):
         # These imports happen only when real inference is requested.
-        from inference_server.generation import (
-            generate_cached, generate_uncached, summarize_result,
-        )
+        from inference_server.generation import generate_batch
 
-        if request.use_kv_cache:
-            generate_fn = generate_cached
-        else:
-            generate_fn = generate_uncached
-        result = generate_fn(
-            prompt=request.prompt,
-            model=app.state.model,
-            tokenizer=app.state.tokenizer,
-            max_new_tokens=request.max_new_tokens,
-            temperature=request.temperature,
-            top_k=request.top_k,
-        )
-        return summarize_result(result, used_kv_cache=request.use_kv_cache)
+        return generate_batch(requests, app.state.model, app.state.tokenizer)
 
-    async def generate(request):
+    async def generate(requests):
         if mode == "simulated":
-            text = await simulate_inference(request.prompt, delay_seconds)
-            return {"text": text, "mode": "simulated"}
+            texts = await simulate_inference([request.prompt for request in requests], delay_seconds)
+            return [{"text": text, "mode": "simulated"} for text in texts]
         # GPU calls block. Move the whole call to a thread so the event loop can
         # still accept requests, reject a full queue, and answer health checks.
-        # The worker awaits this call, so only one /generate runs at a time.
-        return await asyncio.to_thread(generate_real, request)
+        # The worker awaits this call, so only one batch runs at a time.
+        return await asyncio.to_thread(generate_real, requests)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -78,9 +69,9 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20):
             from inference_server.model import load_model
 
             app.state.model, app.state.tokenizer = load_model()
-        # Capacity counts waiting requests; the worker can also have one active.
+        # Capacity counts queued requests; the worker can also hold one batch.
         app.state.queue = asyncio.Queue(maxsize=queue_capacity)
-        worker = asyncio.create_task(run_worker(app.state.queue, generate))
+        worker = asyncio.create_task(run_worker(app.state.queue, generate, batch_size, batch_wait_ms))
         try:
             yield
         finally:
@@ -114,9 +105,9 @@ def create_app(mode="real", delay_seconds=2.0, queue_capacity=20):
         @app.post("/stream")
         async def stream_text(request: GenerateRequest):
             async def chunks():
-                text = await simulate_inference(request.prompt, delay_seconds)
+                texts = await simulate_inference([request.prompt], delay_seconds)
                 # One text chunk after the delay; these are not generated tokens.
-                yield text
+                yield texts[0]
 
             return StreamingResponse(chunks(), media_type="text/plain")
 

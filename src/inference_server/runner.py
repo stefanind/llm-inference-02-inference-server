@@ -47,6 +47,7 @@ async def send_request(client, request: ScheduledRequest, experiment_started_at)
         result["output_tokens"] = body.get("output_tokens")
         result["ttft_ms"] = body.get("ttft_ms")  # Server generation TTFT only.
         result["queue_wait_ms"] = body.get("queue_wait_ms")
+        result["batch_size"] = body.get("batch_size")
     except httpx.HTTPStatusError:
         result["error"] = f"HTTP {response.status_code}: {response.text}"
         # Only 429 explicitly means rejection here; other HTTP failures are errors.

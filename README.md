@@ -1,8 +1,10 @@
 # Simple inference server
 
 A learning project for inference scheduling: HTTP requests enter a FIFO queue,
-then one worker runs inference. The queue holds 20 waiting requests plus one
-active request; excess requests receive HTTP 429.
+then one worker runs batches of up to **four requests**. Starting with its first
+request, a batch waits up to **10 ms** to fill, then runs. A full batch runs
+immediately. The queue holds 20 requests, plus one batch in the worker;
+excess requests receive HTTP 429.
 
 ## Run locally
 
@@ -22,7 +24,8 @@ python -m inference_server.cli run W5 > results.json
 ```
 
 Reports contain individual responses and a summary of throughput, latency,
-errors, and queue waiting. Simulation leaves token measurements unavailable.
+errors, and queue waiting. Each result includes its `batch_size`. Simulation
+waits once per batch and leaves token measurements unavailable.
 
 ## Workloads
 
@@ -42,8 +45,9 @@ python -m inference_server.cli run W6 --rps 2 --duration 30
 ```
 
 Use `--url` for another server. See `python -m inference_server.cli run --help`
-for the remaining options. Keep the same delay when comparing experiments;
-with a two-second delay, W2 takes about 40 seconds with one worker.
+for the remaining options. Keep the same delay when comparing experiments.
+Use `--batch-size 1` on the server to compare with sequential execution;
+`--batch-wait-ms` changes the collection window. Queue waiting includes this window.
 
 The queue serves `/generate`. `/stream` currently bypasses it; run streaming
 separately from queued experiments.
@@ -60,6 +64,9 @@ python -m inference_server.cli --mode real --host 0.0.0.0 --port 8000
 
 The runner works with either inference mode. API docs are at `/docs` on the
 server's local address or Runpod HTTP proxy URL.
+Requests keep their own output limits and sampling settings. If any request
+disables KV caching, its whole batch runs uncached. A batch finishes before new
+requests join; streaming still uses its separate path.
 
 ## Checks
 

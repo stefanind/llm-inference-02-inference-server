@@ -22,6 +22,10 @@ def load_model(model_id=MODEL_ID, device="cuda:0"):
     print(f"Loading {model_id} on {device} with bfloat16", flush=True)
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
+        # Left padding keeps every prompt's last real token at the batch's end.
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
         # An explicit device keeps all layers on this GPU, with no CPU offloading.
         model = AutoModelForCausalLM.from_pretrained(
             model_id,

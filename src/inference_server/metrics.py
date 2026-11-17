@@ -14,10 +14,12 @@ counts, including generated EOS. Simulated calls can omit them. Missing data
 stays None (JSON null); we do not estimate tokens from words or response length.
 The existing ttft_ms input is a generation-only diagnostic, not client TTFT.
 
-queue_wait_ms is measured on the server, from entering the FIFO queue until the
-worker takes the request. It excludes network and HTTP-framework waiting. Queue
+queue_wait_ms is measured on the server, from entering the FIFO queue until batch
+execution begins, including batch collection. It excludes network and HTTP-framework
+waiting. Queue
 summaries cover successful responses only and stay None if any lacks this field.
 Rejected requests never entered the queue and have no queue-wait measurement.
+batch_size is the number of requests at dispatch, not a per-token active count.
 """
 
 

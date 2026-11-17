@@ -25,8 +25,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument(
         "--queue-capacity", type=int, default=20,
-        help="Maximum waiting /generate requests (default: 20; one more can be active)",
+        help="Maximum queued /generate requests (default: 20; one batch can also be active)",
     )
+    parser.add_argument("--batch-size", type=int, default=4, help="Maximum requests per batch (default: 4)")
+    parser.add_argument("--batch-wait-ms", type=float, default=10, help="Batch collection window in ms (default: 10)")
 
     commands = parser.add_subparsers(dest="command")
     run_parser = commands.add_parser("run", help="Submit a workload and print its JSON report")
@@ -72,6 +74,7 @@ def main():
     try:
         app = create_app(
             mode=args.mode, delay_seconds=args.delay, queue_capacity=args.queue_capacity,
+            batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
         )
     except ValueError as error:
         parser.error(str(error))
