@@ -50,11 +50,25 @@ class GenerationTests(unittest.TestCase):
             eos_token_id=-1, decode=lambda tokens, **kwargs: "\ufffd" if len(tokens) == 1 else "é",
         )
         logits = torch.tensor([[0.0, 1.0]])
-        finish_step([job], logits, tokenizer)
+        finish_step([job], logits, tokenizer, stop_token_ids={-1})
         self.assertEqual(job.text_delta, "")
-        finish_step([job], logits, tokenizer)
+        finish_step([job], logits, tokenizer, stop_token_ids={-1})
         self.assertEqual(job.text_delta, "é")
         self.assertEqual(job.response["finish_reason"], "length")
+
+    def test_secondary_model_eos_stops_generation(self):
+        model, tokenizer = make_tiny_model()
+        # Zero logits make greedy decoding return token 0, the secondary EOS.
+        with torch.no_grad():
+            model.lm_head.weight.zero_()
+        model.generation_config.eos_token_id = [2, 0]
+        request = SimpleNamespace(max_new_tokens=3, temperature=0, top_k=None)
+        job = ActiveRequest(request, 0, prompt_token_ids=[1], generation_started_at=time.perf_counter())
+
+        generate_step([job], model, tokenizer)
+
+        self.assertEqual(job.token_ids, [0])
+        self.assertEqual(job.response["finish_reason"], "stop")
 
     def test_generation_tpot_uses_token_ready_times(self):
         job = ActiveRequest(None, 0, prompt_token_ids=[1], token_ids=[1, 2, 3], generation_started_at=1, first_token_at=2)

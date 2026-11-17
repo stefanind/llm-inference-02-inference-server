@@ -98,7 +98,7 @@ def decode(jobs, model, tokenizer, metrics=None):
     return forward_tokens(jobs, sequences, model, tokenizer, metrics, "decode")
 
 
-def finish_step(jobs, logits, tokenizer):
+def finish_step(jobs, logits, tokenizer, stop_token_ids):
     """Select one token per request and finish requests that hit EOS or a limit."""
     for index, job in enumerate(jobs):
         token = select_next_token(
@@ -108,7 +108,8 @@ def finish_step(jobs, logits, tokenizer):
         ready_at = time.perf_counter()
         if job.first_token_at is None:
             job.first_token_at = ready_at
-        finished = token == tokenizer.eos_token_id or len(job.token_ids) >= job.request.max_new_tokens
+        reached_eos = token in stop_token_ids
+        finished = reached_eos or len(job.token_ids) >= job.request.max_new_tokens
         # Decode the history together: one token may contain only part of a UTF-8
         # character. Hold an incomplete trailing character until more bytes arrive.
         text = tokenizer.decode(
@@ -118,18 +119,26 @@ def finish_step(jobs, logits, tokenizer):
             job.text_delta = text[job.text_sent:]
             job.text_sent = len(text)
         if finished:
-            reason = "stop" if token == tokenizer.eos_token_id else "length"
+            reason = "stop" if reached_eos else "length"
             job.response = build_response(job, ready_at, reason)
 
 
 @torch.inference_mode()
 def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None):
     """Decode first, then process prompt chunks within the remaining budget."""
+    # Qwen3 declares two end tokens. The tokenizer only names the primary one.
+    stop_token_ids = {tokenizer.eos_token_id}
+    model_eos = model.generation_config.eos_token_id
+    if isinstance(model_eos, list):
+        stop_token_ids.update(model_eos)
+    elif model_eos is not None:
+        stop_token_ids.add(model_eos)
+
     decoding, chunks = schedule_step(active, max_batched_tokens)
     # Keep these as separate forward passes. A long prefill yields to decode
     # again on the next scheduler iteration instead of running to completion.
     if decoding:
-        finish_step(decoding, decode(decoding, model, tokenizer, metrics), tokenizer)
+        finish_step(decoding, decode(decoding, model, tokenizer, metrics), tokenizer, stop_token_ids)
     if chunks:
         jobs = [job for job, length in chunks]
         chunk_lengths = [length for job, length in chunks]
@@ -137,7 +146,7 @@ def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None
         for index, job in enumerate(jobs):
             # Intermediate chunks build the cache without generating an answer.
             if job.prefill_tokens == len(job.prompt_token_ids):
-                finish_step([job], logits[index:index + 1], tokenizer)
+                finish_step([job], logits[index:index + 1], tokenizer, stop_token_ids)
 
 
 def build_response(job, finished_at, finish_reason):
