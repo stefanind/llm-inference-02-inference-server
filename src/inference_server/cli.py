@@ -1,47 +1,49 @@
-"""Start an inference server, or run a workload against a running server."""
+"""Start the GPU inference server on Runpod, or submit a workload to it."""
 
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 import uvicorn
+import httpx
 
 from inference_server.runner import run_workload
-from inference_server.server import create_app
 from inference_server.workloads import make_w1, make_w2, make_w3, make_w4, make_w5, make_w6
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--mode", choices=["simulated", "real"], default="simulated",
-        help="Inference mode (default: simulated)",
-    )
-    parser.add_argument(
-        "--delay", type=float, default=2.0,
-        help="Seconds per simulated fixed batch (default: 2)",
-    )
-    parser.add_argument("--host", default="127.0.0.1", help="Address to listen on")
+    parser.add_argument("--host", default="0.0.0.0", help="Address to listen on (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    parser.add_argument("--revision", help="Model/tokenizer commit or tag; reports record the resolved commit")
     parser.add_argument(
         "--queue-capacity", type=int, default=20,
-        help="Maximum queued /generate requests (default: 20; one batch can also be active)",
+        help="Maximum queued /generate requests (default: 20)",
     )
-    parser.add_argument("--batch-size", type=int, default=4, help="Maximum requests per batch (default: 4)")
-    parser.add_argument("--batch-wait-ms", type=float, default=10, help="Batch collection window in ms (default: 10)")
+    parser.add_argument("--batch-size", type=int, default=4, help="Maximum active requests (default: 4)")
+    parser.add_argument("--batch-wait-ms", type=float, default=10, help="Initial collection window in ms (default: 10)")
     parser.add_argument(
-        "--scheduler", choices=["fixed", "continuous"], default="fixed",
-        help="Scheduling mode (default: fixed)",
+        "--max-batched-tokens", type=int, default=512,
+        help="Input tokens per scheduling iteration; at least --batch-size (default: 512)",
     )
     parser.add_argument(
-        "--step-delay", type=float, default=0.01,
-        help="Seconds per simulated continuous decode step (default: 0.01)",
+        "--max-context-tokens", type=int, default=4096,
+        help="Prompt plus output limit per request, capped by the model's context (default: 4096)",
+    )
+    parser.add_argument(
+        "--max-cache-tokens", type=int, default=8192,
+        help="Shared cache-token reservation budget for active requests (default: 8192)",
     )
 
     commands = parser.add_subparsers(dest="command")
     run_parser = commands.add_parser("run", help="Submit a workload and print its JSON report")
     run_parser.add_argument("workload", choices=["W1", "W2", "W3", "W4", "W5", "W6"])
-    run_parser.add_argument("--url", default="http://127.0.0.1:8000", help="Server address")
+    run_parser.add_argument("--url", default="http://127.0.0.1:8000", help="Server base URL, without /v1")
+    run_parser.add_argument("--backend", choices=["repo", "vllm"], default="repo", help="Server API (default: repo)")
+    run_parser.add_argument("--model", help="Served model name; required with --backend vllm")
+    run_parser.add_argument("--server-info", help="vLLM server configuration JSON file to record as supplied")
+    run_parser.add_argument("--gpu-uuid", help="Server GPU UUID to sample via NVML; run this client on the GPU host")
     run_parser.add_argument(
         "--timeout", type=float, default=60,
         help="HTTP operation timeout in seconds (default: 60)",
@@ -54,13 +56,18 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
+        workload_settings = {}
         try:
+            server_info = None
+            if args.server_info:
+                server_info = json.loads(Path(args.server_info).read_text(encoding="utf-8"))
             if args.workload == "W1":
                 requests = make_w1()
             elif args.workload == "W2":
                 requests = make_w2()
             elif args.workload == "W3":
                 requests = make_w3(seed=args.seed)
+                workload_settings = {"seed": args.seed}
             elif args.workload == "W4":
                 if not args.short_prompt or not args.long_prompt:
                     run_parser.error("W4 requires --short-prompt and --long-prompt")
@@ -69,27 +76,37 @@ def main():
                 requests = make_w5()
             else:
                 requests = make_w6(requests_per_second=args.rps, duration_seconds=args.duration)
+                workload_settings = {"rps": args.rps, "duration_seconds": args.duration}
 
             report = asyncio.run(run_workload(
                 requests, server_url=args.url, timeout_seconds=args.timeout,
+                backend=args.backend, model=args.model,
+                workload_name=args.workload, workload_settings=workload_settings,
+                server_info=server_info,
+                gpu_uuid=args.gpu_uuid,
             ))
-        except ValueError as error:
+        except (ValueError, OSError, httpx.HTTPError) as error:
             run_parser.error(str(error))
         # Redirect stdout to a file to keep both individual results and the summary.
         print(json.dumps(report, indent=2))
         return
 
+    # Workload clients and --help do not need to import the model libraries.
+    from inference_server.server import create_app
+
     try:
         app = create_app(
-            mode=args.mode, delay_seconds=args.delay, queue_capacity=args.queue_capacity,
+            queue_capacity=args.queue_capacity,
             batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
-            scheduler=args.scheduler, step_delay_seconds=args.step_delay,
+            max_batched_tokens=args.max_batched_tokens,
+            max_context_tokens=args.max_context_tokens, max_cache_tokens=args.max_cache_tokens,
+            revision=args.revision,
         )
     except ValueError as error:
         parser.error(str(error))
 
-    print(f"Starting {args.mode} inference server", flush=True)
-    # Keep one server process. Real mode loads one model during its startup.
+    print("Starting GPU inference server", flush=True)
+    # Keep one server process so the model is loaded only once.
     uvicorn.run(app, host=args.host, port=args.port, workers=1)
 
 

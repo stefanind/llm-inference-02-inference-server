@@ -11,10 +11,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
-]
-
-[project.optional-dependencies]
-gpu = [
+    "nvidia-ml-py",
     "torch==2.9.1",
     "transformers==5.10.2",
     "accelerate",

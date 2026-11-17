@@ -1,21 +1,52 @@
-"""A FIFO queue with fixed-batch and continuous workers for /generate."""
+"""A FIFO queue and continuous inference worker for /generate."""
 
 import asyncio
 import time
 from dataclasses import dataclass, field
 
-from inference_server.metrics import elapsed_ms
+from inference_server.metrics import EngineMetrics, elapsed_ms
 
 
-async def submit_request(queue, request):
-    """Enqueue without waiting for space, then wait for this request's answer.
+class RequestTooLarge(ValueError):
+    """A request that exceeds the context limit or the entire cache budget."""
 
-    A Future is a place for the worker to deliver an answer later. QueueFull is
-    allowed to reach the HTTP handler, which turns it into a 429 response.
-    """
-    answer = asyncio.get_running_loop().create_future()
-    queue.put_nowait((request, answer, time.perf_counter()))
-    return await answer
+
+@dataclass
+class RequestQueue:
+    """Shared limits and waiting count for the HTTP handlers and worker."""
+    capacity: int = 20
+    max_context_tokens: int = 4096
+    max_cache_tokens: int = 8192
+    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Include requests collected by the worker but still waiting for cache space.
+    waiting: int = 0
+    metrics: EngineMetrics = field(default_factory=EngineMetrics)
+
+
+def submit_request(requests, request, prompt_token_ids):
+    """Validate and enqueue before HTTP headers are sent; return its stream state."""
+    required_tokens = len(prompt_token_ids) + request.max_new_tokens
+    if required_tokens > requests.max_context_tokens:
+        raise RequestTooLarge(
+            f"Prompt plus output limit needs {required_tokens} tokens; "
+            f"context limit is {requests.max_context_tokens}"
+        )
+    if required_tokens > requests.max_cache_tokens:
+        raise RequestTooLarge(
+            f"Request needs {required_tokens} cache tokens; "
+            f"cache budget is {requests.max_cache_tokens}, so it can never fit"
+        )
+    if requests.waiting >= requests.capacity:
+        raise asyncio.QueueFull
+
+    job = ActiveRequest(
+        request, time.perf_counter(), prompt_token_ids=prompt_token_ids,
+        reserved_cache_tokens=required_tokens,
+    )
+    requests.queue.put_nowait(job)
+    requests.waiting += 1
+    requests.metrics.record_queue(requests.waiting)
+    return job
 
 
 async def collect_batch(queue, batch_size, batch_wait_ms):
@@ -36,84 +67,99 @@ async def collect_batch(queue, batch_size, batch_wait_ms):
     return batch
 
 
-async def run_worker(queue, generate, batch_size=4, batch_wait_ms=10):
-    """Finish one fixed batch before starting the next."""
-    while True:
-        batch = await collect_batch(queue, batch_size, batch_wait_ms)
-        try:
-            jobs = [job for job in batch if not job[1].cancelled()]
-            if not jobs:
-                continue
-            started_at = time.perf_counter()
-            responses = await generate([request for request, _, _ in jobs])
-            if len(responses) != len(jobs):
-                raise RuntimeError("Inference must return one response per request")
-
-            for (_, answer, enqueued_at), response in zip(jobs, responses):
-                # Queue time includes waiting for this batch to form.
-                response["queue_wait_ms"] = elapsed_ms(enqueued_at, started_at)
-                response["batch_size"] = len(jobs)
-                if not answer.done():
-                    answer.set_result(response)
-        except Exception as error:
-            # A failed batch must not stop the worker or leave its callers waiting.
-            for _, answer, _ in batch:
-                if not answer.done():
-                    answer.set_exception(error)
-        finally:
-            # join() uses this count to wait for accepted work during shutdown.
-            for _ in batch:
-                queue.task_done()
-
-
 @dataclass
 class ActiveRequest:
-    """State kept between decode steps. The Future belongs to its HTTP handler."""
+    """State kept from enqueue through generation, with an outgoing event queue."""
     request: object
-    answer: asyncio.Future
     enqueued_at: float
+    events: asyncio.Queue = field(default_factory=asyncio.Queue)
+    cancelled: bool = False
     started_at: float | None = None
     batch_size: int = 0
-    steps_completed: int = 0
     response: dict | None = None
-    # Real inference initializes these lazily. Simulation does not need them.
+    # Tokenize once before queueing; only admitted requests build a GPU cache.
     prompt_token_ids: list[int] | None = None
+    reserved_cache_tokens: int = 0
+    prefill_tokens: int = 0  # Prompt tokens already processed by the model.
     token_ids: list[int] = field(default_factory=list)
+    text_sent: int = 0  # Characters already emitted from the decoded token history.
+    text_delta: str = ""  # Prepared in the GPU thread, published by the async worker.
     generation_started_at: float | None = None
     first_token_at: float | None = None
+    kv_cache: object | None = None
 
 
-async def run_continuous_worker(queue, step, batch_size=4, batch_wait_ms=10):
-    """Advance active requests one step, release finished ones, then refill."""
+def schedule_step(active, max_batched_tokens):
+    """Give decode requests one token each, then spend the rest on FIFO prefill.
+
+    The budget counts real input tokens, excluding padding and cached history.
+    Server configuration ensures it can cover one decode per active request.
+    """
+    decoding = []
+    for job in active:
+        if job.prefill_tokens == len(job.prompt_token_ids):
+            decoding.append(job)
+
+    remaining_budget = max_batched_tokens - len(decoding)
+    prefill_chunks = []
+    for job in active:
+        remaining_prompt = len(job.prompt_token_ids) - job.prefill_tokens
+        if remaining_prompt > 0 and remaining_budget > 0:
+            chunk_size = min(remaining_prompt, remaining_budget)
+            prefill_chunks.append((job, chunk_size))
+            remaining_budget -= chunk_size
+    return decoding, prefill_chunks
+
+
+async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
+    """Run one scheduling iteration, release finished requests, then refill."""
+    queue = requests.queue
     active = []
+    waiting = []
     while True:
         # Cancelled handlers no longer need a slot. A queued cancellation is
         # checked below when we take it from the queue.
         remaining = []
         for job in active:
-            if job.answer.cancelled():
+            if job.cancelled:
+                job.kv_cache = None
                 queue.task_done()
             else:
                 remaining.append(job)
         active = remaining
+        requests.metrics.record_active(len(active), sum(job.reserved_cache_tokens for job in active))
 
-        if not active:
-            jobs = await collect_batch(queue, batch_size, batch_wait_ms)
-        else:
-            # Existing requests keep moving. Never pause their next step just
-            # to wait for another arrival to fill an empty slot.
-            jobs = []
-            while len(active) + len(jobs) < batch_size:
-                try:
-                    jobs.append(queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    break
+        if not active and not waiting:
+            waiting = await collect_batch(queue, batch_size, batch_wait_ms)
 
-        for request, answer, enqueued_at in jobs:
-            if answer.cancelled():
+        # Gather arrivals and remove cancelled waiters at every boundary, even
+        # when all active slots are full. All waiting jobs still count at admission.
+        while not queue.empty():
+            waiting.append(queue.get_nowait())
+        remaining = []
+        for job in waiting:
+            if job.cancelled:
+                requests.waiting -= 1
                 queue.task_done()
             else:
-                active.append(ActiveRequest(request, answer, enqueued_at))
+                remaining.append(job)
+        waiting = remaining
+
+        # Reservations belong to active requests. Removing a finished, failed,
+        # or cancelled request releases its reservation on the next iteration.
+        reserved_tokens = sum(job.reserved_cache_tokens for job in active)
+        while waiting and len(active) < batch_size:
+            job = waiting[0]
+            if reserved_tokens + job.reserved_cache_tokens > requests.max_cache_tokens:
+                # Preserve FIFO: smaller requests behind this one also wait.
+                # Existing requests keep decoding and eventually free space.
+                break
+            waiting.pop(0)
+            requests.waiting -= 1
+            reserved_tokens += job.reserved_cache_tokens
+            active.append(job)
+        requests.metrics.record_queue(requests.waiting)
+        requests.metrics.record_active(len(active), reserved_tokens)
         if not active:
             continue
 
@@ -121,27 +167,39 @@ async def run_continuous_worker(queue, step, batch_size=4, batch_wait_ms=10):
         for job in active:
             if job.started_at is None:
                 job.started_at = started_at
-                # Membership can change later. This is the first step's size.
+                job.generation_started_at = started_at
+                # This counts active requests at admission, not a model batch.
                 job.batch_size = len(active)
         try:
             await step(active)
         except Exception as error:
             # A failed step releases its callers; the worker can serve new work.
             for job in active:
-                if not job.answer.done():
-                    job.answer.set_exception(error)
+                job.kv_cache = None
+                if not job.cancelled:
+                    job.events.put_nowait({"type": "error", "error": str(error)})
                 queue.task_done()
             active = []
+            requests.metrics.record_active(0, 0)
             continue
 
         remaining = []
         for job in active:
+            if job.cancelled:
+                job.kv_cache = None
+                queue.task_done()
+                continue
+            if job.text_delta:
+                job.events.put_nowait({"type": "text", "text": job.text_delta})
+                job.text_delta = ""
             if job.response is None:
                 remaining.append(job)
                 continue
             job.response["queue_wait_ms"] = elapsed_ms(job.enqueued_at, job.started_at)
             job.response["batch_size"] = job.batch_size
-            if not job.answer.done():
-                job.answer.set_result(job.response)
+            job.response["type"] = "done"
+            job.kv_cache = None
+            job.events.put_nowait(job.response)
             queue.task_done()
         active = remaining
+        requests.metrics.record_active(len(active), sum(job.reserved_cache_tokens for job in active))

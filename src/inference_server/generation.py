@@ -1,29 +1,24 @@
-"""The original prompt preparation, sampling, and generation functions."""
+"""Token sampling and continuous generation with per-request KV caches."""
 
 import time
 from typing import Optional
 
 import torch
 
-from inference_server.model import sync_gpu
+from inference_server.cache import combine_caches, save_caches
+from inference_server.engine import schedule_step
 
 
-def prepare_inputs(prompt: str, model, tokenizer):
+def tokenize_prompt(prompt, tokenizer):
+    """Prepare the full chat prompt once, before context checks and admission."""
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": prompt}
+        {"role": "user", "content": prompt},
     ]
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        enable_thinking=False,
-        return_tensors="pt",
-        return_dict=True
+    return tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, enable_thinking=False,
+        return_dict=False,
     )
-
-    assert messages, "Add the prompt messages"
-    assert inputs is not None, "Render the prompt with the tokenizer"
-    return {key: value.to(model.device) for key, value in inputs.items()}
 
 
 def select_next_token(
@@ -44,375 +39,124 @@ def select_next_token(
         )
 
     probabilities = torch.softmax(scaled_logits, dim=-1)
-    next_token = torch.multinomial(probabilities, num_samples=1)
-    assert next_token is not None, "Sample one token"
-    return next_token
+    return torch.multinomial(probabilities, num_samples=1)
 
 
-@torch.inference_mode()
-def generate_uncached(
-    prompt: str,
-    model,
-    tokenizer,
-    max_new_tokens: int = 32,
-    temperature: float = 0.0,
-    top_k: Optional[int] = None,
-) -> dict:
-    inputs = prepare_inputs(prompt, model, tokenizer)
-    generated_ids = inputs["input_ids"] # B, S
-    attention_mask = inputs["attention_mask"] # B, S
-    prompt_length = generated_ids.shape[1]
-    first_token_at = None
-
-    sync_gpu(model.device)
-    started_at = time.perf_counter()
-    for _ in range(max_new_tokens):
-        outputs = model(
-            input_ids=generated_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        )
-
-        next_token = select_next_token( # B, 1
-            outputs.logits[:, -1, :], # B S vocab
-            temperature,
-            top_k,
-        )
-        if first_token_at is None:
-            sync_gpu(model.device)
-            first_token_at = time.perf_counter() # ttft
-
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
-        attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=1)
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    sync_gpu(model.device)
-    finished_at = time.perf_counter()
-    completion_ids = generated_ids[0, prompt_length:]
-    return {
-        "text": tokenizer.decode(completion_ids, skip_special_tokens=True),
-        "token_ids": completion_ids.tolist(),
-        "input_tokens": prompt_length,
-        "ttft_ms": (first_token_at - started_at) * 1000,
-        "latency_ms": (finished_at - started_at) * 1000,
-    }
-
-
-@torch.inference_mode()
-def generate_cached(
-    prompt: str,
-    model,
-    tokenizer,
-    max_new_tokens: int = 32,
-    temperature: float = 0.0,
-    top_k: Optional[int] = None,
-) -> dict:
-    inputs = prepare_inputs(prompt, model, tokenizer)
-    generated_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    prompt_length = generated_ids.shape[1]
-    first_token_at = None
-
-    sync_gpu(model.device)
-    started_at = time.perf_counter()
-    # prefill
-    outputs = model(
-        input_ids=generated_ids,
-        attention_mask=attention_mask,
-        use_cache=True, # returns past_key_values as an attribute
-    )
-    # have the key values
-    past_key_values = outputs.past_key_values
-
-    for _ in range(max_new_tokens):
-        next_token = select_next_token( # B, 1
-            outputs.logits[:, -1, :], # B S vocab
-            temperature,
-            top_k,
-        )
-        assert next_token is not None, "Select the next token"
-        if first_token_at is None:
-            sync_gpu(model.device)
-            first_token_at = time.perf_counter()
-
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-        attention_mask = torch.cat([
-            attention_mask,
-            torch.ones_like(next_token),
-        ], dim=1)
-
-        # only pass next_token since we have kv cache
-        # return the next kv cache
-        outputs = model(
-            input_ids=next_token, # B 1
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True
-        )
-        past_key_values = outputs.past_key_values
-
-    sync_gpu(model.device)
-    finished_at = time.perf_counter()
-    completion_ids = generated_ids[0, prompt_length:]
-    return {
-        "text": tokenizer.decode(completion_ids, skip_special_tokens=True),
-        "token_ids": completion_ids.tolist(),
-        "input_tokens": prompt_length,
-        "ttft_ms": (first_token_at - started_at) * 1000,
-        "latency_ms": (finished_at - started_at) * 1000,
-    }
-
-
-@torch.inference_mode()
-def generate_batch(requests, model, tokenizer) -> list[dict]:
-    """Run one fixed batch. Finished rows stay padded until every request ends."""
-    conversations = []
-    for request in requests:
-        conversations.append([
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": request.prompt},
-        ])
-    inputs = tokenizer.apply_chat_template(
-        conversations,
-        add_generation_prompt=True,
-        enable_thinking=False,
-        padding=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
-    generated_ids = inputs["input_ids"].to(model.device)
-    attention_mask = inputs["attention_mask"].to(model.device)
-    prompt_lengths = attention_mask.sum(dim=1).tolist()
-
-    # A model forward has one cache setting. If anyone opts out, the entire
-    # batch runs uncached; used_kv_cache reports what actually happened.
-    use_kv_cache = all(request.use_kv_cache for request in requests)
-    past_key_values = None
-    token_ids = [[] for _ in requests]
-    first_token_at = [None] * len(requests)
-    finished_at = [None] * len(requests)
-    finished = [False] * len(requests)
-
-    sync_gpu(model.device)
-    started_at = time.perf_counter()
-    for _ in range(max(request.max_new_tokens for request in requests)):
-        # Padding must not change a prompt's token positions. The mask gives
-        # real tokens positions 0, 1, 2, ... independently for each row.
-        position_ids = attention_mask.cumsum(dim=1) - 1
-        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
-        input_ids = generated_ids
-        if use_kv_cache and past_key_values is not None:
-            input_ids = generated_ids[:, -1:]
-            position_ids = position_ids[:, -1:]
-
-        # One forward processes all rows together: prefill first, then decode.
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_kv_cache,
-        )
-        if use_kv_cache:
-            past_key_values = outputs.past_key_values
-
-        next_tokens = torch.full(
-            (len(requests), 1), tokenizer.pad_token_id,
-            dtype=generated_ids.dtype, device=model.device,
-        )
-        next_mask = torch.zeros_like(next_tokens)
-        for index, request in enumerate(requests):
-            if finished[index]:
-                continue
-            # Sampling settings and output limits belong to each request.
-            token = select_next_token(
-                outputs.logits[index:index + 1, -1, :], request.temperature, request.top_k,
-            )
-            next_tokens[index] = token[0]
-            next_mask[index] = 1
-            token_id = token.item()
-            token_ids[index].append(token_id)
-            ready_at = time.perf_counter()
-            if first_token_at[index] is None:
-                first_token_at[index] = ready_at
-            if token_id == tokenizer.eos_token_id or len(token_ids[index]) == request.max_new_tokens:
-                finished[index] = True
-                finished_at[index] = ready_at
-
-        if all(finished):
-            break
-        generated_ids = torch.cat([generated_ids, next_tokens], dim=1)
-        attention_mask = torch.cat([attention_mask, next_mask], dim=1)
-
-    results = []
-    for index in range(len(requests)):
-        result = {
-            "text": tokenizer.decode(token_ids[index], skip_special_tokens=True),
-            "token_ids": token_ids[index],
-            "input_tokens": prompt_lengths[index],
-            "ttft_ms": (first_token_at[index] - started_at) * 1000,
-            "latency_ms": (finished_at[index] - started_at) * 1000,
-        }
-        results.append(summarize_result(result, used_kv_cache=use_kv_cache))
-    return results
-
-
-@torch.inference_mode()
-def generate_step(active, model, tokenizer):
-    """Advance every active request by one real token in one batched forward.
-
-    Recompute prefixes without a KV cache so rows can join and leave freely.
-    Generation timing starts when this backend first initializes each request.
-    """
-    sequences = []
-    for job in active:
-        if job.prompt_token_ids is None:
-            job.generation_started_at = time.perf_counter()
-            messages = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": job.request.prompt},
-            ]
-            job.prompt_token_ids = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, enable_thinking=False,
-                return_dict=False,
-            )
-        sequences.append(job.prompt_token_ids + job.token_ids)
-
-    # Membership and sequence lengths can change on every step. Left padding
-    # puts each request's last real token at the end of its row.
+def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
+    """Process prompt chunks or decode tokens, reusing each request's history."""
+    cache, past_width = combine_caches(jobs)
+    # Left-pad histories and new inputs separately. Position IDs count only
+    # real tokens, so a resumed prompt keeps the same positions as a whole one.
     width = max(len(sequence) for sequence in sequences)
     input_ids = []
     masks = []
-    for sequence in sequences:
+    positions = []
+    for job, sequence in zip(jobs, sequences):
+        past_length = 0
+        if job.kv_cache is not None:
+            past_length = job.kv_cache[0][0].shape[2]
         padding = width - len(sequence)
         input_ids.append([tokenizer.pad_token_id] * padding + sequence)
-        masks.append([0] * padding + [1] * len(sequence))
+        masks.append(
+            [0] * (past_width - past_length) + [1] * past_length
+            + [0] * padding + [1] * len(sequence)
+        )
+        positions.append(
+            [0] * padding + list(range(past_length, past_length + len(sequence)))
+        )
     input_ids = torch.tensor(input_ids, dtype=torch.long, device=model.device)
     attention_mask = torch.tensor(masks, dtype=torch.long, device=model.device)
-    position_ids = attention_mask.cumsum(dim=1) - 1
-    position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+    position_ids = torch.tensor(positions, dtype=torch.long, device=model.device)
+    if metrics is not None:
+        metrics.record_forward(phase, len(jobs))
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        use_cache=False,
+        past_key_values=cache,
+        use_cache=True,
     )
+    save_caches(jobs, outputs.past_key_values, past_width, [len(sequence) for sequence in sequences])
+    return outputs.logits[:, -1, :]
 
-    for index, job in enumerate(active):
+
+def prefill(jobs, chunk_lengths, model, tokenizer, metrics=None):
+    """Process just the scheduled part of each prompt and remember our progress."""
+    sequences = []
+    for job, length in zip(jobs, chunk_lengths):
+        start = job.prefill_tokens
+        sequences.append(job.prompt_token_ids[start:start + length])
+    logits = forward_tokens(jobs, sequences, model, tokenizer, metrics, "prefill")
+    for job, length in zip(jobs, chunk_lengths):
+        job.prefill_tokens += length
+    return logits
+
+
+def decode(jobs, model, tokenizer, metrics=None):
+    """Process only each request's newest token using its cached history."""
+    sequences = [[job.token_ids[-1]] for job in jobs]
+    return forward_tokens(jobs, sequences, model, tokenizer, metrics, "decode")
+
+
+def finish_step(jobs, logits, tokenizer):
+    """Select one token per request and finish requests that hit EOS or a limit."""
+    for index, job in enumerate(jobs):
         token = select_next_token(
-            outputs.logits[index:index + 1, -1, :], job.request.temperature, job.request.top_k,
+            logits[index:index + 1], job.request.temperature, job.request.top_k,
         ).item()
         job.token_ids.append(token)
-        job.steps_completed += 1
         ready_at = time.perf_counter()
         if job.first_token_at is None:
             job.first_token_at = ready_at
-        if token == tokenizer.eos_token_id or len(job.token_ids) >= job.request.max_new_tokens:
-            result = {
-                "text": tokenizer.decode(job.token_ids, skip_special_tokens=True),
-                "token_ids": job.token_ids,
-                "input_tokens": len(job.prompt_token_ids),
-                "ttft_ms": (job.first_token_at - job.generation_started_at) * 1000,
-                "latency_ms": (ready_at - job.generation_started_at) * 1000,
-            }
-            job.response = summarize_result(result, used_kv_cache=False)
-            job.response["scheduler"] = "continuous"
-
-
-def summarize_result(result: dict, used_kv_cache: bool) -> dict:
-
-    output_tokens = len(result['token_ids'])
-    # ITL
-    # decode_time_seconds = (
-    #     result["latency_ms"] - result["ttft_ms"]
-    # ) / 1000
-
-    # output_tokens_per_second = (
-    #     (output_tokens - 1) / decode_time_seconds
-    #     if output_tokens > 1 and decode_time_seconds > 0
-    #     else 0.0
-    # )
-    # output_tokens = len(result["token_ids"])
-
-    total_time_seconds = result["latency_ms"] / 1000
-
-    output_tokens_per_second = (
-        output_tokens / total_time_seconds
-        if total_time_seconds > 0
-        else 0.0
-    )
-
-    return {
-        "text": result["text"],
-        "ttft_ms": round(result["ttft_ms"], 2),
-        "latency_ms": round(result["latency_ms"], 2),
-        "input_tokens": result["input_tokens"],
-        "output_tokens": output_tokens,
-        "output_tokens_per_second": round(output_tokens_per_second, 2),
-        "used_kv_cache": used_kv_cache,
-    }
+        finished = token == tokenizer.eos_token_id or len(job.token_ids) >= job.request.max_new_tokens
+        # Decode the history together: one token may contain only part of a UTF-8
+        # character. Hold an incomplete trailing character until more bytes arrive.
+        text = tokenizer.decode(
+            job.token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )
+        if finished or not text.endswith("\ufffd"):
+            job.text_delta = text[job.text_sent:]
+            job.text_sent = len(text)
+        if finished:
+            reason = "stop" if token == tokenizer.eos_token_id else "length"
+            job.response = build_response(job, ready_at, reason)
 
 
 @torch.inference_mode()
-def generate_stream(
-    prompt: str,
-    model,
-    tokenizer,
-    max_new_tokens: int = 32,
-    temperature: float = 0.0,
-    top_k: Optional[int] = None,
-):
-    inputs = prepare_inputs(prompt, model, tokenizer)
-    generated_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    prompt_length = generated_ids.shape[1]
+def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None):
+    """Decode first, then process prompt chunks within the remaining budget."""
+    decoding, chunks = schedule_step(active, max_batched_tokens)
+    # Keep these as separate forward passes. A long prefill yields to decode
+    # again on the next scheduler iteration instead of running to completion.
+    if decoding:
+        finish_step(decoding, decode(decoding, model, tokenizer, metrics), tokenizer)
+    if chunks:
+        jobs = [job for job, length in chunks]
+        chunk_lengths = [length for job, length in chunks]
+        logits = prefill(jobs, chunk_lengths, model, tokenizer, metrics)
+        for index, job in enumerate(jobs):
+            # Intermediate chunks build the cache without generating an answer.
+            if job.prefill_tokens == len(job.prompt_token_ids):
+                finish_step([job], logits[index:index + 1], tokenizer)
 
-    outputs = model(
-        input_ids=generated_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-    )
-    past_key_values = outputs.past_key_values
-    previous_text = ""
 
-    for _ in range(max_new_tokens):
-        next_token = select_next_token( # B, 1
-            outputs.logits[:, -1, :], # B S vocab
-            temperature,
-            top_k,
-        )
-        assert next_token is not None, "Select the next token"
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+def build_response(job, finished_at, finish_reason):
+    """Final stream metadata. Text was already emitted in incremental chunks."""
+    output_tokens = len(job.token_ids)
+    elapsed_seconds = finished_at - job.generation_started_at
+    output_tokens_per_second = 0.0
+    if elapsed_seconds > 0:
+        output_tokens_per_second = output_tokens / elapsed_seconds
+    generation_tpot_ms = None
+    if output_tokens > 1:
+        generation_tpot_ms = (finished_at - job.first_token_at) * 1000 / (output_tokens - 1)
 
-        current_text = tokenizer.decode(
-            generated_ids[0, prompt_length:],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-        chunk = current_text[len(previous_text):]
-        if chunk:
-            yield chunk
-        previous_text = current_text
-
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-        attention_mask = torch.cat([
-            attention_mask,
-            torch.ones(
-                (1, 1),
-                dtype=attention_mask.dtype,
-                device=model.device,
-            ),
-        ], dim=1)
-        outputs = model(
-            input_ids=next_token,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
+    return {
+        "finish_reason": finish_reason,
+        "generation_tpot_ms": round(generation_tpot_ms, 2) if generation_tpot_ms is not None else None,
+        "ttft_ms": round((job.first_token_at - job.generation_started_at) * 1000, 2),
+        "latency_ms": round(elapsed_seconds * 1000, 2),
+        "input_tokens": len(job.prompt_token_ids),
+        "output_tokens": output_tokens,
+        "output_tokens_per_second": round(output_tokens_per_second, 2),
+    }

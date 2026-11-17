@@ -71,7 +71,6 @@ def make_w4(short_prompt: str, long_prompt: str) -> list[ScheduledRequest]:
 
     Supply prepared prompt texts; token lengths must be checked separately with
     the real model's tokenizer. We do not modify them or guess tokens from words.
-    Simulation still uses its fixed delay for every request.
     """
     groups = [
         (short_prompt, 32),
@@ -118,8 +117,9 @@ def make_w6(requests_per_second: float, duration_seconds: float = 30) -> list[Sc
 
     Schedule the first request at zero, then at fixed intervals strictly before
     the end of the arrival window. Earlier responses do not affect these times.
-    Run rates separately after earlier server work has finished. The runner waits
-    for all client calls; a timeout cannot confirm that server work has stopped.
+    Run rates separately after earlier server work has finished. The repo runner
+    also waits for the engine to drain before collecting counters. With vLLM,
+    a client timeout alone cannot confirm that server work has stopped.
     """
     if not math.isfinite(requests_per_second) or requests_per_second <= 0:
         raise ValueError("requests_per_second must be positive and finite")
