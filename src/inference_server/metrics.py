@@ -45,7 +45,8 @@ GPU definitions and measurements live in gpu_metrics.py: NVML samples device
 busyness/VRAM on the client host; server-side PyTorch tracks tensor allocations.
 """
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -84,6 +85,24 @@ class EngineMetrics:
     decode_forward_count: int = 0
     decode_batch_total: int = 0
     peak_decode_batch_size: int = 0
+    profile_enabled: bool = False
+    profile: dict | None = field(init=False, default=None)
+
+    def __post_init__(self):
+        if self.profile_enabled:
+            self.profile = {}
+            for phase in ("prefill", "decode"):
+                self.profile[phase] = {
+                    "batch_setup": {"calls": 0, "total_ms": 0.0},
+                    "model_forward": {"calls": 0, "total_ms": 0.0},
+                    "cache_save": {"calls": 0, "total_ms": 0.0},
+                    "token_handling": {"calls": 0, "total_ms": 0.0},
+                }
+
+    def record_stage(self, phase, stage, duration_ms):
+        timing = self.profile[phase][stage]
+        timing["calls"] += 1
+        timing["total_ms"] += duration_ms
 
     def record_queue(self, queued):
         self.queued_requests = queued
@@ -119,6 +138,8 @@ class EngineMetrics:
             "decode_forward_count": self.decode_forward_count,
             "mean_decode_batch_size": self.decode_batch_total / self.decode_forward_count if self.decode_forward_count else None,
             "peak_decode_batch_size": self.peak_decode_batch_size,
+            # Take a copy for readers while the worker continues to record.
+            "profile": deepcopy(self.profile),
         }
 
 

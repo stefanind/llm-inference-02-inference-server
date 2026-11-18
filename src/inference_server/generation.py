@@ -9,6 +9,20 @@ from inference_server.cache import combine_caches, save_caches
 from inference_server.engine import schedule_step
 
 
+def profile_time(device):
+    # CUDA launches are asynchronous. Wait for the GPU before reading the clock
+    # so work from one stage does not show up in the next stage's time.
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
+
+
+def finish_timing(metrics, phase, stage, started_at, device):
+    finished_at = profile_time(device)
+    metrics.record_stage(phase, stage, (finished_at - started_at) * 1000)
+    return finished_at
+
+
 def tokenize_prompt(prompt, tokenizer):
     """Prepare the full chat prompt once, before context checks and admission."""
     messages = [
@@ -44,6 +58,10 @@ def select_next_token(
 
 def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
     """Process prompt chunks or decode tokens, reusing each request's history."""
+    profile = metrics is not None and metrics.profile_enabled
+    if profile:
+        started_at = profile_time(model.device)
+
     cache, past_width = combine_caches(jobs)
     # Left-pad histories and new inputs separately. Position IDs count only
     # real tokens, so a resumed prompt keeps the same positions as a whole one.
@@ -67,6 +85,9 @@ def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
     input_ids = torch.tensor(input_ids, dtype=torch.long, device=model.device)
     attention_mask = torch.tensor(masks, dtype=torch.long, device=model.device)
     position_ids = torch.tensor(positions, dtype=torch.long, device=model.device)
+    if profile:
+        started_at = finish_timing(metrics, phase, "batch_setup", started_at, model.device)
+
     if metrics is not None:
         metrics.record_forward(phase, len(jobs))
     outputs = model(
@@ -76,7 +97,12 @@ def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
         past_key_values=cache,
         use_cache=True,
     )
+    if profile:
+        started_at = finish_timing(metrics, phase, "model_forward", started_at, model.device)
+
     save_caches(jobs, outputs.past_key_values, past_width, [len(sequence) for sequence in sequences])
+    if profile:
+        finish_timing(metrics, phase, "cache_save", started_at, model.device)
     return outputs.logits[:, -1, :]
 
 
@@ -126,6 +152,7 @@ def finish_step(jobs, logits, tokenizer, stop_token_ids):
 @torch.inference_mode()
 def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None):
     """Decode first, then process prompt chunks within the remaining budget."""
+    profile = metrics is not None and metrics.profile_enabled
     # Qwen3 declares two end tokens. The tokenizer only names the primary one.
     stop_token_ids = {tokenizer.eos_token_id}
     model_eos = model.generation_config.eos_token_id
@@ -138,15 +165,24 @@ def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None
     # Keep these as separate forward passes. A long prefill yields to decode
     # again on the next scheduler iteration instead of running to completion.
     if decoding:
-        finish_step(decoding, decode(decoding, model, tokenizer, metrics), tokenizer, stop_token_ids)
+        logits = decode(decoding, model, tokenizer, metrics)
+        if profile:
+            started_at = profile_time(model.device)
+        finish_step(decoding, logits, tokenizer, stop_token_ids)
+        if profile:
+            finish_timing(metrics, "decode", "token_handling", started_at, model.device)
     if chunks:
         jobs = [job for job, length in chunks]
         chunk_lengths = [length for job, length in chunks]
         logits = prefill(jobs, chunk_lengths, model, tokenizer, metrics)
+        if profile:
+            started_at = profile_time(model.device)
         for index, job in enumerate(jobs):
             # Intermediate chunks build the cache without generating an answer.
             if job.prefill_tokens == len(job.prompt_token_ids):
                 finish_step([job], logits[index:index + 1], tokenizer, stop_token_ids)
+        if profile:
+            finish_timing(metrics, "prefill", "token_handling", started_at, model.device)
 
 
 def build_response(job, finished_at, finish_reason):

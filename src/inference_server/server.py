@@ -73,7 +73,7 @@ def stream_response(job, request):
 def create_app(
     queue_capacity=20, batch_size=4, batch_wait_ms=10, max_batched_tokens=512,
     max_context_tokens=4096, max_cache_tokens=8192,
-    revision=None,
+    revision=None, profile=False,
 ):
     """Build the GPU inference server. Load one BF16 model during startup."""
     if queue_capacity <= 0:
@@ -105,6 +105,7 @@ def create_app(
         app.state.requests = RequestQueue(
             capacity=queue_capacity, max_context_tokens=context_limit,
             max_cache_tokens=max_cache_tokens,
+            metrics=EngineMetrics(profile_enabled=profile),
         )
         model = app.state.model
         app.state.gpu_memory = TorchMemoryMetrics(model.device)
@@ -135,6 +136,7 @@ def create_app(
                 "max_batched_tokens": max_batched_tokens,
                 "max_context_tokens": context_limit,
                 "max_cache_tokens": max_cache_tokens,
+                "profile_enabled": profile,
             },
         }
         print(f"Context limit: {context_limit} tokens; cache budget: {max_cache_tokens} tokens", flush=True)
@@ -176,7 +178,7 @@ def create_app(
         if requests.waiting or requests.metrics.active_requests:
             raise HTTPException(status_code=409, detail="Wait for the engine to become idle before resetting metrics")
         # No model forward is running, so replacing the counters is safe.
-        requests.metrics = EngineMetrics()
+        requests.metrics = EngineMetrics(profile_enabled=profile)
         app.state.gpu_memory.reset()
         result = requests.metrics.snapshot()
         result.update(app.state.gpu_memory.snapshot())

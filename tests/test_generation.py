@@ -9,6 +9,7 @@ from tiny_model import make_tiny_model
 
 from inference_server.engine import ActiveRequest
 from inference_server.generation import build_response, finish_step, generate_step
+from inference_server.metrics import EngineMetrics
 
 
 class GenerationTests(unittest.TestCase):
@@ -75,3 +76,20 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(build_response(job, 4, "length")["generation_tpot_ms"], 1000)
         job.token_ids = [1]
         self.assertIsNone(build_response(job, 2, "stop")["generation_tpot_ms"])
+
+    def test_profile_records_chunked_prefill_and_decode(self):
+        model, tokenizer = make_tiny_model()
+        request = SimpleNamespace(max_new_tokens=2, temperature=0, top_k=None)
+        job = ActiveRequest(
+            request, 0, prompt_token_ids=[1, 2, 3], generation_started_at=time.perf_counter(),
+        )
+        metrics = EngineMetrics(profile_enabled=True)
+
+        for _ in range(3):
+            generate_step([job], model, tokenizer, max_batched_tokens=2, metrics=metrics)
+
+        profile = metrics.snapshot()["profile"]
+        for phase, expected_calls in (("prefill", 2), ("decode", 1)):
+            self.assertEqual(profile[phase]["model_forward"]["calls"], expected_calls)
+            for timing in profile[phase].values():
+                self.assertGreater(timing["total_ms"], 0)

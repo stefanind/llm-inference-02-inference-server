@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Address to listen on (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--revision", help="Model/tokenizer commit or tag; reports record the resolved commit")
+    parser.add_argument("--profile", action="store_true", help="Time prefill and decode stages with CUDA synchronization")
     parser.add_argument(
         "--queue-capacity", type=int, default=20,
         help="Maximum queued /generate requests (default: 20)",
@@ -100,7 +101,7 @@ def main():
             batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
             max_batched_tokens=args.max_batched_tokens,
             max_context_tokens=args.max_context_tokens, max_cache_tokens=args.max_cache_tokens,
-            revision=args.revision,
+            revision=args.revision, profile=args.profile,
         )
     except ValueError as error:
         parser.error(str(error))
