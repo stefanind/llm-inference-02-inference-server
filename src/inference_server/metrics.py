@@ -101,6 +101,7 @@ class EngineMetrics:
                 }
 
     def record_stage(self, phase, stage, duration_ms):
+        """Accumulate the elapsed time and count of profiled batch stages."""
         timing = self.profile[phase][stage]
         timing["calls"] += 1
         timing["total_ms"] += duration_ms
@@ -116,6 +117,7 @@ class EngineMetrics:
         self.peak_reserved_cache_tokens = max(self.peak_reserved_cache_tokens, reserved)
 
     def record_forward(self, phase, size):
+        """Count real requests in each prefill or decode forward."""
         if phase == "prefill":
             self.prefill_forward_count += 1
             self.prefill_batch_total += size
@@ -263,6 +265,7 @@ def summarize_http_results(results, elapsed_seconds):
         "timed_out_requests": timed_out_requests,
         "other_error_requests": other_error_requests,
         "error_rate_percent": error_rate_percent,
+        # Throughput uses the elapsed time for the whole workload, including drain.
         "requests_per_second": per_second(successful_requests, elapsed_seconds),
         "average_latency_ms": average_latency_ms,
         "p50_latency_ms": percentile(latencies, 50),

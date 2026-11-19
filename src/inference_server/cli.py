@@ -56,6 +56,7 @@ def main():
     run_parser.add_argument("--duration", type=float, default=30, help="W6 arrival-window seconds")
     args = parser.parse_args()
 
+    # Benchmark client entry point. Without "run", this process starts the server.
     if args.command == "run":
         workload_settings = {}
         try:

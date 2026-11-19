@@ -43,10 +43,11 @@ class RequestStream(StreamingResponse):
 
 
 def stream_response(job, request):
-    """Send worker events and cancel the job when its client disconnects."""
+    """SSE streaming: send a request's text, completion, or error events."""
     async def events():
         async def watch_disconnect():
-            # Keep listening while generation or a slow socket is waiting.
+            # Disconnect detection also runs while generation is between chunks.
+            # The engine sees the cancellation flag at its next step boundary.
             while True:
                 message = await request.receive()
                 if message["type"] == "http.disconnect":
@@ -91,8 +92,8 @@ def create_app(
         raise ValueError("max_cache_tokens must be positive")
 
     async def step(active):
-        # GPU work runs in a thread so HTTP handling stays responsive.
-        # The worker awaits one scheduling iteration before changing membership.
+        # Async serving: the GPU step runs in a thread, so the HTTP event loop
+        # can accept requests and deliver text while the model runs.
         await asyncio.to_thread(
             generate_step, active, app.state.model, app.state.tokenizer, app.state.cache,
             max_batched_tokens, app.state.requests.metrics,
@@ -109,6 +110,8 @@ def create_app(
             metrics=EngineMetrics(profile_enabled=profile),
         )
         model = app.state.model
+        # Physical cache allocation: give each active slot its own GPU row.
+        # The shared admission budget separately limits active reservations.
         cache_tokens_per_slot = min(context_limit, max_cache_tokens)
         app.state.cache = SlotCache(model, batch_size, cache_tokens_per_slot)
         app.state.gpu_memory = TorchMemoryMetrics(model.device)
@@ -183,7 +186,8 @@ def create_app(
         requests = app.state.requests
         if requests.waiting or requests.metrics.active_requests:
             raise HTTPException(status_code=409, detail="Wait for the engine to become idle before resetting metrics")
-        # No model forward is running, so replacing the counters is safe.
+        # Reset after warmup so the next workload starts with fresh counters
+        # and a VRAM baseline that includes the model and persistent cache.
         requests.metrics = EngineMetrics(profile_enabled=profile)
         app.state.gpu_memory.reset()
         result = requests.metrics.snapshot()
@@ -192,7 +196,8 @@ def create_app(
 
     @app.post("/generate", response_class=StreamingResponse)
     async def generate_text(request: GenerateRequest, connection: Request):
-        # CPU tokenization stays outside the GPU worker and its generation timer.
+        # Request intake: format and tokenize before admission so limits use
+        # the actual model input length and rejections can use an HTTP status.
         prompt_token_ids = await asyncio.to_thread(tokenize_prompt, request.prompt, app.state.tokenizer)
         try:
             job = submit_request(app.state.requests, request, prompt_token_ids)

@@ -14,7 +14,7 @@ from inference_server.workloads import ScheduledRequest
 
 
 def build_request(request: ScheduledRequest, backend, model):
-    """Translate one scheduled request into the selected server's HTTP format."""
+    """Benchmark adapter: send the same prompt and output limit to either API."""
     if backend == "repo":
         return "/generate", {
             "prompt": request.prompt,
@@ -93,8 +93,8 @@ def parse_event(body, backend):
 
 async def send_request(client, request: ScheduledRequest, experiment_started_at, backend, model, client_metrics):
     """Wait for one request's deadline, send it, and return its observed result."""
-    # Every task uses the same experiment start, so earlier requests cannot
-    # shift this request's arrival time by taking longer to finish.
+    # Open-loop arrivals: schedule each request from the same experiment
+    # clock, independently of when earlier requests finish.
     deadline = experiment_started_at + request.arrival_ms / 1000
     remaining_seconds = deadline - time.perf_counter()
     if remaining_seconds > 0:
@@ -147,6 +147,8 @@ async def send_request(client, request: ScheduledRequest, experiment_started_at,
                 if text:
                     received_at = time.perf_counter()
                     if last_text_at is None:
+                        # Client TTFT includes request delivery, server wait,
+                        # generation, and the first nonempty chunk's transit.
                         result["client_ttft_ms"] = elapsed_ms(started_at, received_at)
                     else:
                         result["text_chunk_intervals_ms"].append(elapsed_ms(last_text_at, received_at))
@@ -250,6 +252,8 @@ async def run_workload(
     )
     engine_metrics = None
     engine_metrics_error = None
+    # Count outstanding HTTP calls at the client. The engine separately
+    # counts active requests with an assigned cache slot.
     client_metrics = ClientMetrics()
     async with httpx.AsyncClient(
         base_url=server_url, timeout=timeout_seconds, limits=limits,

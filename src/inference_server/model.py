@@ -29,7 +29,7 @@ def load_model(model_id=MODEL_ID, device="cuda:0", revision=None):
         tokenizer.padding_side = "left"
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        # An explicit device keeps all layers on this GPU, with no CPU offloading.
+        # GPU model loading: keep every layer's weights in BF16 on one CUDA device.
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             config=config,

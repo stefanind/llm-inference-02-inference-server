@@ -15,7 +15,8 @@ class SlotCache:
         self.dtype = model.dtype
         self.tokens_per_slot = tokens_per_slot
         shape = (slots, config.num_key_value_heads, tokens_per_slot, config.head_dim)
-        # The worker keeps these tensors for the lifetime of the server.
+        # Persistent KV cache: allocate [slot, KV head, token, head feature]
+        # buffers once. The same slot holds a request's history across steps.
         self.keys = [torch.zeros(shape, device=self.device, dtype=self.dtype) for _ in config.layer_types]
         self.values = [torch.zeros_like(key) for key in self.keys]
 
@@ -40,6 +41,8 @@ class SlotCache:
                 raise ValueError("Request does not fit in its KV cache slot")
             padding = width - len(sequence)
             inputs[row] = [pad_token_id] * padding + sequence
+            # Positions are relative to the request's history, even when its
+            # slot used to hold another request or its input has left padding.
             positions[row] = [0] * padding + list(range(job.cache_length, end))
             output_rows.append(row)
             end_positions.append(end)
@@ -54,8 +57,9 @@ class SlotCache:
         input_ids = torch.tensor(inputs, device=self.device)
         position_ids = torch.tensor(positions, device=self.device)
 
-        # A single decode token with a full history can see every key. For
-        # other batches, hide future positions and stale data in reused slots.
+        # Causal attention mask: a query can see its own and earlier positions.
+        # This also hides stale data beyond the new history. A single decode
+        # token can skip the mask when every real row has the same key width.
         mask = None
         if width != 1 or any(end != self.key_width for end in end_positions):
             key_positions = torch.arange(self.key_width, device=self.device)
@@ -71,8 +75,8 @@ class SlotCache:
         keys = self.keys[layer_idx][self.first_slot:self.last_slot]
         values = self.values[layer_idx][self.first_slot:self.last_slot]
         rows = self.write_rows
-        # Index only the new tokens. The returned slices share the original
-        # storage, so the history stays in place even when the batch changes.
+        # In-place KV append: copy only the new tokens into this layer's
+        # buffers. Attention receives views of the history in the same storage.
         keys[rows, :, self.write_positions] = key_states[rows, :, self.input_columns]
         values[rows, :, self.write_positions] = value_states[rows, :, self.input_columns]
         return keys[:, :, :self.key_width], values[:, :, :self.key_width]

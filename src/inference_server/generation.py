@@ -9,8 +9,8 @@ from inference_server.engine import schedule_step
 
 
 def profile_time(device):
-    # CUDA launches are asynchronous. Wait for the GPU before reading the clock
-    # so work from one stage does not show up in the next stage's time.
+    # Profiling with --profile: wait for the GPU at stage boundaries so each
+    # stage is charged for its own CUDA work.
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return time.perf_counter()
@@ -23,7 +23,7 @@ def finish_timing(metrics, phase, stage, started_at, device):
 
 
 def tokenize_prompt(prompt, tokenizer):
-    """Prepare the full chat prompt once, before context checks and admission."""
+    """Chat template and tokenization: turn the messages into model input IDs."""
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt},
@@ -39,11 +39,13 @@ def select_next_token(
     temperature: float,
     top_k: Optional[int] = None,
 ) -> torch.Tensor:
+    """Token selection: greedy at temperature zero, otherwise sample."""
     if temperature == 0:
         return torch.argmax(logits, dim=-1, keepdim=True)
 
     scaled_logits = logits / temperature
     if top_k is not None:
+        # Top-k filtering drops candidates whose score is below the cutoff.
         top_values = torch.topk(scaled_logits, top_k, dim=-1).values
         cutoff = top_values[..., -1:]
         scaled_logits = scaled_logits.masked_fill(
@@ -69,6 +71,8 @@ def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
 
     if metrics is not None:
         metrics.record_forward(phase, len(jobs))
+    # Model forward: score the next token. Inside each attention layer, Qwen3
+    # calls SlotCache.update() to write new keys and values into the slot.
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -83,13 +87,15 @@ def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
     # lengths only after the whole forward succeeds.
     for job, sequence in zip(jobs, sequences):
         job.cache_length += len(sequence)
+    # The last input position predicts the next token. Return rows in request
+    # order, skipping any empty slots that were padded into the batch.
     if output_rows == list(range(input_ids.shape[0])):
         return outputs.logits[:, -1, :]
     return outputs.logits[output_rows, -1, :]
 
 
 def prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics):
-    """Process just the scheduled part of each prompt and remember our progress."""
+    """Chunked prefill: feed only the prompt slice chosen by schedule_step."""
     sequences = []
     for job, length in zip(jobs, chunk_lengths):
         start = job.prefill_tokens
@@ -101,7 +107,7 @@ def prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics):
 
 
 def decode(jobs, model, tokenizer, cache, metrics):
-    """Process only each request's newest token using its cached history."""
+    """Autoregressive decode: feed the last generated token and reuse its history."""
     sequences = [[job.token_ids[-1]] for job in jobs]
     return forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, "decode")
 
@@ -109,12 +115,15 @@ def decode(jobs, model, tokenizer, cache, metrics):
 def finish_step(jobs, logits, tokenizer, stop_token_ids):
     """Select one token per request and finish requests that hit EOS or a limit."""
     for index, job in enumerate(jobs):
+        # Sample one row at a time. .item() brings its token ID back to Python.
         token = select_next_token(
             logits[index:index + 1], job.request.temperature, job.request.top_k,
         ).item()
         job.token_ids.append(token)
         ready_at = time.perf_counter()
         if job.first_token_at is None:
+            # Engine TTFT ends when the first token is ready. The HTTP client
+            # measures time to first visible text separately.
             job.first_token_at = ready_at
         reached_eos = token in stop_token_ids
         finished = reached_eos or len(job.token_ids) >= job.request.max_new_tokens
@@ -131,6 +140,7 @@ def finish_step(jobs, logits, tokenizer, stop_token_ids):
             job.response = build_response(job, ready_at, reason)
 
 
+# Inference mode keeps PyTorch from recording gradients in the serving loop.
 @torch.inference_mode()
 def generate_step(active, model, tokenizer, cache, max_batched_tokens=512, metrics=None):
     """Decode first, then process prompt chunks within the remaining budget."""
@@ -176,6 +186,7 @@ def build_response(job, finished_at, finish_reason):
         output_tokens_per_second = output_tokens / elapsed_seconds
     generation_tpot_ms = None
     if output_tokens > 1:
+        # Engine time per output token averages the gaps after the first token.
         generation_tpot_ms = (finished_at - job.first_token_at) * 1000 / (output_tokens - 1)
 
     return {

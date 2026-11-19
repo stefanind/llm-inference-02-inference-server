@@ -25,6 +25,7 @@ class RequestQueue:
 
 def submit_request(requests, request, prompt_token_ids):
     """Validate and enqueue before HTTP headers are sent; return its stream state."""
+    # Request limits: use the formatted prompt length plus the maximum output.
     required_tokens = len(prompt_token_ids) + request.max_new_tokens
     if required_tokens > requests.max_context_tokens:
         raise RequestTooLarge(
@@ -36,6 +37,7 @@ def submit_request(requests, request, prompt_token_ids):
             f"Request needs {required_tokens} cache tokens; "
             f"cache budget is {requests.max_cache_tokens}, so it can never fit"
         )
+    # Backpressure: reject at the door when all waiting places are taken.
     if requests.waiting >= requests.capacity:
         raise asyncio.QueueFull
 
@@ -50,7 +52,7 @@ def submit_request(requests, request, prompt_token_ids):
 
 
 async def collect_batch(queue, batch_size, batch_wait_ms):
-    """Wait for the first request, then collect until full or the deadline."""
+    """Initial batching: collect until the first batch is full or its timer expires."""
     batch = [await queue.get()]
     deadline = time.perf_counter() + batch_wait_ms / 1000
     while len(batch) < batch_size:
@@ -87,10 +89,11 @@ class ActiveRequest:
     generation_started_at: float | None = None
     first_token_at: float | None = None
     cache_slot: int | None = None
-    cache_length: int = 0
+    cache_length: int = 0  # Tokens already written to this slot.
 
     def release_cache_slot(self):
-        # The next occupant starts with an empty history in the same buffer.
+        # Reset ownership and length. The slot's GPU buffer stays allocated;
+        # the next occupant's attention mask hides the unused positions.
         self.cache_slot = None
         self.cache_length = 0
 
@@ -101,11 +104,14 @@ def schedule_step(active, max_batched_tokens):
     The budget counts real input tokens, excluding padding and cached history.
     Server configuration ensures it can cover one decode per active request.
     """
+    # Decode priority: budget one input token for each fully processed prompt.
     decoding = []
     for job in active:
         if job.prefill_tokens == len(job.prompt_token_ids):
             decoding.append(job)
 
+    # Chunked prefill: spend the remaining budget on prompt slices. A prompt
+    # that cannot fit here resumes from prefill_tokens on a later iteration.
     remaining_budget = max_batched_tokens - len(decoding)
     prefill_chunks = []
     for job in active:
@@ -123,8 +129,8 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
     active = []
     waiting = []
     while True:
-        # Cancelled handlers no longer need a slot. A queued cancellation is
-        # checked below when we take it from the queue.
+        # Cancellation takes effect at a step boundary. Release the slots of
+        # disconnected callers before deciding who to admit next.
         remaining = []
         for job in active:
             if job.cancelled:
@@ -138,8 +144,8 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
         if not active and not waiting:
             waiting = await collect_batch(queue, batch_size, batch_wait_ms)
 
-        # Gather arrivals and remove cancelled waiters at every boundary, even
-        # when all active slots are full. All waiting jobs still count at admission.
+        # Continuous batching: refresh the waiting list each step so new work
+        # can fill open slots while other requests are still decoding.
         while not queue.empty():
             waiting.append(queue.get_nowait())
         remaining = []
@@ -151,8 +157,8 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
                 remaining.append(job)
         waiting = remaining
 
-        # Reservations belong to active requests. Removing a finished, failed,
-        # or cancelled request releases its reservation on the next iteration.
+        # Cache admission needs both a free slot and room in the shared
+        # reservation budget. Only active requests count against that budget.
         reserved_tokens = sum(job.reserved_cache_tokens for job in active)
         free_slots = list(range(batch_size))
         for job in active:
@@ -200,11 +206,13 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
                 queue.task_done()
                 continue
             if job.text_delta:
+                # Hand off newly generated text to the HTTP streaming handler.
                 job.events.put_nowait({"type": "text", "text": job.text_delta})
                 job.text_delta = ""
             if job.response is None:
                 remaining.append(job)
                 continue
+            # Queue wait is enqueue to admission, before the first model step.
             job.response["queue_wait_ms"] = elapsed_ms(job.enqueued_at, job.started_at)
             job.response["batch_size"] = job.batch_size
             job.response["type"] = "done"

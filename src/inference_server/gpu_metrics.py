@@ -38,6 +38,7 @@ class GpuSampler:
         self.elapsed_seconds = None
 
     def sample(self, include_utilization=True):
+        """Read device-wide VRAM and GPU activity through NVIDIA's NVML API."""
         if self.handle is None:
             return
         try:
@@ -126,7 +127,7 @@ class GpuSampler:
 
 
 class TorchMemoryMetrics:
-    """Tensor allocations in the server process, including loaded model weights.
+    """Server tensor allocations, including model weights and persistent KV buffers.
 
     This is separate from device VRAM and excludes unused allocator reservations.
     Reset while idle after warmup; read after the engine drains. Errors or a

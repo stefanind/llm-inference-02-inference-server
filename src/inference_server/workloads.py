@@ -69,8 +69,8 @@ def make_w3(seed: int = 42) -> list[ScheduledRequest]:
 def make_w4(short_prompt: str, long_prompt: str) -> list[ScheduledRequest]:
     """W4: five requests for each short/long prompt and output-limit combination.
 
-    Supply prepared prompt texts; token lengths must be checked separately with
-    the real model's tokenizer. We do not modify them or guess tokens from words.
+    Long prompts exercise chunked prefill when they exceed the step budget.
+    The server reports actual token counts after applying the chat template.
     """
     groups = [
         (short_prompt, 32),
@@ -97,7 +97,7 @@ def make_w5() -> list[ScheduledRequest]:
     """W5: 20 users each submit 20 requests at time zero: 400 total.
 
     User IDs label sources; they do not impose a per-user concurrency limit.
-    Once admission control exists, explicit rejections are valid outcomes.
+    Requests beyond the server's queue capacity can be rejected with HTTP 429.
     """
     requests = []
     for user_id in range(1, 21):
