@@ -7,6 +7,7 @@ By default, the server allocates four 4,096-token slots at startup and limits
 total active reservations to 8,192 tokens.
 
 [Run 01 benchmark results](BENCHMARK.md) compare this server with vLLM on an RTX 3090.
+[How it works](HOW_IT_WORKS.md) follows a request through the source code.
 
 | Workload | What it tests |
 | --- | --- |
@@ -111,6 +112,45 @@ then traces eight warmed decode steps on four W2 requests. Open
 `kv_write`. `operators.txt` ranks CPU and CUDA operations across the captured
 steps. Use the normal W2/W4 runs for throughput comparisons.
 [PyTorch profiler](https://docs.pytorch.org/docs/2.9/profiler.html)
+
+## Compare compiled decode
+
+`--compile-decode` compiles the two hidden-state RMSNorms in each Qwen3 layer
+during decode. They share a compiled function because each receives one token
+per row. Run 05 showed many small operations inside these norms that the compiler
+can fuse. Prefill runs eager. [PyTorch compile](https://docs.pytorch.org/docs/2.9/generated/torch.compile.html)
+
+On the same Pod and model revision, run the server twice. Start with the first
+command, warm up and measure W2, then stop it and repeat with the second.
+
+```bash
+python -m inference_server.cli --host 127.0.0.1 --revision "$REVISION"
+python -m inference_server.cli --host 127.0.0.1 --revision "$REVISION" --compile-decode
+```
+
+Run this in the client terminal for each server. Set `mode=compiled` on the
+second pass. The first decode calls compile on demand, so keep the warmup
+separate from the measurement.
+
+```bash
+mode=eager
+out="results/run-06/$mode"
+mkdir -p "$out"
+python -m inference_server.cli run W2 --timeout 300 > "$out/warmup.json" &&
+  python -m inference_server.cli run W2 --timeout 300 > "$out/W2.json"
+```
+
+Check for 20 successes in each warmup and measured report. Compare output
+tokens per second and generation time per output token. The report records the
+flag under `run_info.server.settings.compile_decode`. Stop the server before
+tracing and save each trace separately.
+
+```bash
+python scripts/profile_decode.py --revision "$REVISION" \
+  --output-dir results/run-06/eager/trace
+python scripts/profile_decode.py --revision "$REVISION" --compile-decode \
+  --output-dir results/run-06/compiled/trace
+```
 
 ## Optional full comparison (W1–W6)
 

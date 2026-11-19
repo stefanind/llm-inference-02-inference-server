@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 import torch
 
 from inference_server.cache import SlotCache
+from inference_server.decode_compile import DecodeNorms
 from inference_server.engine import RequestQueue, RequestTooLarge, run_worker, submit_request
 from inference_server.generation import generate_step, tokenize_prompt
 from inference_server.gpu_metrics import TorchMemoryMetrics
@@ -75,7 +76,7 @@ def stream_response(job, request):
 def create_app(
     queue_capacity=20, batch_size=4, batch_wait_ms=10, max_batched_tokens=512,
     max_context_tokens=4096, max_cache_tokens=8192,
-    revision=None, profile=False,
+    revision=None, profile=False, compile_decode=False,
 ):
     """Build the GPU inference server. Load one BF16 model during startup."""
     if queue_capacity <= 0:
@@ -110,6 +111,8 @@ def create_app(
             metrics=EngineMetrics(profile_enabled=profile),
         )
         model = app.state.model
+        if compile_decode:
+            model.decode_norms = DecodeNorms(model)
         # Physical cache allocation: give each active slot its own GPU row.
         # The shared admission budget separately limits active reservations.
         cache_tokens_per_slot = min(context_limit, max_cache_tokens)
@@ -145,6 +148,7 @@ def create_app(
                 "cache_layout": "fixed_slots",
                 "cache_tokens_per_slot": cache_tokens_per_slot,
                 "profile_enabled": profile,
+                "compile_decode": compile_decode,
             },
         }
         print(f"Context limit: {context_limit} tokens; cache budget: {max_cache_tokens} tokens", flush=True)

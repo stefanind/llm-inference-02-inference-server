@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--revision", help="Model/tokenizer commit or tag; reports record the resolved commit")
     parser.add_argument("--profile", action="store_true", help="Time prefill and decode stages with CUDA synchronization")
+    parser.add_argument("--compile-decode", action="store_true", help="Compile Qwen3's decoder-layer RMSNorms during decode")
     parser.add_argument(
         "--queue-capacity", type=int, default=20,
         help="Maximum queued /generate requests (default: 20)",
@@ -102,7 +103,7 @@ def main():
             batch_size=args.batch_size, batch_wait_ms=args.batch_wait_ms,
             max_batched_tokens=args.max_batched_tokens,
             max_context_tokens=args.max_context_tokens, max_cache_tokens=args.max_cache_tokens,
-            revision=args.revision, profile=args.profile,
+            revision=args.revision, profile=args.profile, compile_decode=args.compile_decode,
         )
     except ValueError as error:
         parser.error(str(error))

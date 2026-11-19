@@ -3,17 +3,46 @@
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from tiny_model import make_tiny_model
 
 from inference_server.cache import SlotCache
+from inference_server.decode_compile import DecodeNorms
 from inference_server.engine import ActiveRequest
-from inference_server.generation import build_response, finish_step, generate_step
+from inference_server.generation import build_response, decode, finish_step, generate_step, prefill
 from inference_server.metrics import EngineMetrics
 
 
 class GenerationTests(unittest.TestCase):
+    @torch.inference_mode()
+    def test_decode_norms_share_one_graph_and_skip_prefill(self):
+        model, tokenizer = make_tiny_model()
+        expected = model(torch.tensor([[1, 3]]), use_cache=False).logits[:, -1, :]
+        cache = SlotCache(model, slots=1, tokens_per_slot=4)
+        job = ActiveRequest(None, 0, prompt_token_ids=[1], cache_slot=0)
+        graphs = []
+
+        def capture_graph(graph, _inputs):
+            graphs.append(graph)
+            return graph.forward  # Run the captured graph on CPU without a CUDA compiler.
+
+        compile_norm = torch.compile
+
+        def compile_on_cpu(fn, **options):
+            return compile_norm(fn, backend=capture_graph, **options)
+
+        with patch("torch.compile", side_effect=compile_on_cpu):
+            model.decode_norms = DecodeNorms(model)
+
+        prefill([job], [1], model, tokenizer, cache, None)
+        self.assertEqual(len(graphs), 0)
+        job.token_ids.append(3)
+        logits = decode([job], model, tokenizer, cache, None)
+        self.assertEqual(len(graphs), 1)
+        torch.testing.assert_close(logits, expected)
+
     def test_chunked_mixed_batches_match_individual_generation(self):
         model, tokenizer = make_tiny_model()
         cache = SlotCache(model, slots=3, tokens_per_slot=12)

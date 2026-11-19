@@ -11,6 +11,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from inference_server.cache import SlotCache
+from inference_server.decode_compile import DecodeNorms
 from inference_server.engine import ActiveRequest
 from inference_server.generation import decode, generate_step, prefill, tokenize_prompt
 from inference_server.model import load_model
@@ -141,6 +142,7 @@ def run_diagnostic(model, tokenizer, output_dir):
         "device": str(model.device),
         "dtype": str(model.dtype),
         "gpu_name": torch.cuda.get_device_name(model.device) if model.device.type == "cuda" else None,
+        "compile_decode": getattr(model, "decode_norms", None) is not None,
         "w2_requests": [request.request_id for request in requests],
         "w2_prompt_tokens": [len(prompt) for prompt in prompts],
         "warmup_decode_steps": WARMUP_STEPS,
@@ -161,9 +163,12 @@ def run_diagnostic(model, tokenizer, output_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", help="Model and tokenizer checkpoint revision")
+    parser.add_argument("--compile-decode", action="store_true", help="Compile Qwen3's decoder-layer RMSNorms during decode")
     parser.add_argument("--output-dir", type=Path, default=Path("results/run-05/decode-trace"))
     args = parser.parse_args()
     model, tokenizer = load_model(revision=args.revision)
+    if args.compile_decode:
+        model.decode_norms = DecodeNorms(model)
     run_diagnostic(model, tokenizer, args.output_dir)
 
 

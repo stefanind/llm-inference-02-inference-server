@@ -112,6 +112,40 @@ measured trial per workload, so the percentages above are observed differences
 across Pods. A comparison of both revisions on one Pod would isolate the
 cache change more closely.
 
-The next diagnostic is a short trace inside model forward. It can show how
-much of the remaining decode time goes to cache writes, attention, matrix
-multiplication, and launching GPU work.
+## Run 05 — look inside model forward
+
+Run 03 put about 98% of profiled decode time inside `model_forward`. We used
+the [decode profiling script](scripts/profile_decode.py#L91) to split that cost
+into CPU work and GPU operations. The capture covers eight warmed decode steps
+for four W2 requests on an RTX 3090. The prompt lengths were 30, 30, 31, and
+31 tokens.
+
+| Trace measurement across eight steps | Observed |
+| --- | ---: |
+| Elapsed time in the decode steps | 631.65 ms |
+| Elapsed time inside model forward | 615.31 ms |
+| Time covered by GPU kernels, copies, and memory sets | 130.73 ms |
+| GPU kernel launches recorded | 18,584 |
+| Matrix multiplication time on the GPU | 90.55 ms |
+| Attention kernel time on the GPU | 4.90 ms |
+| KV-write operations' GPU time | 4.76 ms |
+
+The GPU was doing recorded work for about **21% of the captured decode
+windows**, with about **2,323 kernels per step**. CUDA kernel launch calls took
+about **131 ms on the CPU** across the capture. Matrix multiplication was the
+largest GPU cost, while the timeline showed substantial gaps between kernels.
+The profiler adds overhead. These measurements guide where to investigate,
+and the unprofiled HTTP runs measure throughput. GPU scope annotations in the
+operator table can span gaps and overlap each other.
+
+The [logit check](scripts/profile_decode.py#L59) matched the highest-scoring
+token in **9 of 10** comparisons. The one mismatch came in the reused slot
+at forced decode step 4. The reference's top two scores were only 0.125 apart.
+That result leaves open whether the difference came from numerical variation
+between the batched and single-request paths. Comparing a fresh slot and a
+reused slot with identical batch shapes would test for stale history more
+directly.
+
+The next performance experiment should test a way to reduce CPU launch work
+in a stable part of decode. Use a short trace to check whether it reduces
+kernel launches, then measure W2 on the same Pod with profiling off.

@@ -73,13 +73,18 @@ def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
         metrics.record_forward(phase, len(jobs))
     # Model forward: score the next token. Inside each attention layer, Qwen3
     # calls SlotCache.update() to write new keys and values into the slot.
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=cache,
-        use_cache=True,
-    )
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "past_key_values": cache,
+        "use_cache": True,
+    }
+    decode_norms = getattr(model, "decode_norms", None)
+    if phase == "decode" and decode_norms is not None:
+        outputs = decode_norms.run_decode(model, **inputs)
+    else:
+        outputs = model(**inputs)
     if profile:
         finish_timing(metrics, phase, "model_forward", started_at, model.device)
 
