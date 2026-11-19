@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import torch
 from tiny_model import make_tiny_model
 
+from inference_server.cache import SlotCache
 from inference_server.engine import ActiveRequest
 from inference_server.generation import build_response, finish_step, generate_step
 from inference_server.metrics import EngineMetrics
@@ -15,6 +16,7 @@ from inference_server.metrics import EngineMetrics
 class GenerationTests(unittest.TestCase):
     def test_chunked_mixed_batches_match_individual_generation(self):
         model, tokenizer = make_tiny_model()
+        cache = SlotCache(model, slots=3, tokens_per_slot=12)
         prompts = [[1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11], [12, 13, 14]]
         jobs = []
         expected = []
@@ -29,18 +31,22 @@ class GenerationTests(unittest.TestCase):
             )
             expected.append(output[0, len(prompt):].tolist())
 
-        # Two slots exercise chunking, mixed history lengths, and a new arrival
-        # joining the same prefill batch as a partially processed prompt.
+        # Leave a hole between the first two slots, then reuse slot 0 for a
+        # new request while the long prompt in slot 2 is still being processed.
         active = jobs[:2]
+        active[0].cache_slot = 0
+        active[1].cache_slot = 2
         waiting = jobs[2:]
         while active:
-            generate_step(active, model, tokenizer, max_batched_tokens=4)
+            generate_step(active, model, tokenizer, cache, max_batched_tokens=4)
             for job in active:
                 if job.prefill_tokens < len(job.prompt_token_ids):
                     self.assertEqual(job.token_ids, [])
             active = [job for job in active if job.response is None]
             if waiting and len(active) < 2:
-                active.append(waiting.pop(0))
+                new_job = waiting.pop()
+                new_job.cache_slot = 0
+                active.append(new_job)
 
         self.assertEqual([job.token_ids for job in jobs], expected)
 
@@ -64,9 +70,12 @@ class GenerationTests(unittest.TestCase):
             model.lm_head.weight.zero_()
         model.generation_config.eos_token_id = [2, 0]
         request = SimpleNamespace(max_new_tokens=3, temperature=0, top_k=None)
-        job = ActiveRequest(request, 0, prompt_token_ids=[1], generation_started_at=time.perf_counter())
+        job = ActiveRequest(
+            request, 0, prompt_token_ids=[1], generation_started_at=time.perf_counter(), cache_slot=0,
+        )
+        cache = SlotCache(model, slots=1, tokens_per_slot=4)
 
-        generate_step([job], model, tokenizer)
+        generate_step([job], model, tokenizer, cache)
 
         self.assertEqual(job.token_ids, [0])
         self.assertEqual(job.response["finish_reason"], "stop")
@@ -81,15 +90,17 @@ class GenerationTests(unittest.TestCase):
         model, tokenizer = make_tiny_model()
         request = SimpleNamespace(max_new_tokens=2, temperature=0, top_k=None)
         job = ActiveRequest(
-            request, 0, prompt_token_ids=[1, 2, 3], generation_started_at=time.perf_counter(),
+            request, 0, prompt_token_ids=[1, 2, 3], generation_started_at=time.perf_counter(), cache_slot=0,
         )
+        cache = SlotCache(model, slots=1, tokens_per_slot=5)
         metrics = EngineMetrics(profile_enabled=True)
 
         for _ in range(3):
-            generate_step([job], model, tokenizer, max_batched_tokens=2, metrics=metrics)
+            generate_step([job], model, tokenizer, cache, max_batched_tokens=2, metrics=metrics)
 
         profile = metrics.snapshot()["profile"]
         for phase, expected_calls in (("prefill", 2), ("decode", 1)):
             self.assertEqual(profile[phase]["model_forward"]["calls"], expected_calls)
-            for timing in profile[phase].values():
-                self.assertGreater(timing["total_ms"], 0)
+            for stage in ("batch_setup", "model_forward", "token_handling"):
+                self.assertGreater(profile[phase][stage]["total_ms"], 0)
+            self.assertEqual(profile[phase]["cache_save"]["calls"], 0)

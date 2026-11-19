@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import torch
 
+from inference_server.cache import SlotCache
 from inference_server.engine import RequestQueue, RequestTooLarge, run_worker, submit_request
 from inference_server.generation import generate_step, tokenize_prompt
 from inference_server.gpu_metrics import TorchMemoryMetrics
@@ -93,8 +94,8 @@ def create_app(
         # GPU work runs in a thread so HTTP handling stays responsive.
         # The worker awaits one scheduling iteration before changing membership.
         await asyncio.to_thread(
-            generate_step, active, app.state.model, app.state.tokenizer, max_batched_tokens,
-            app.state.requests.metrics,
+            generate_step, active, app.state.model, app.state.tokenizer, app.state.cache,
+            max_batched_tokens, app.state.requests.metrics,
         )
 
     @asynccontextmanager
@@ -108,6 +109,8 @@ def create_app(
             metrics=EngineMetrics(profile_enabled=profile),
         )
         model = app.state.model
+        cache_tokens_per_slot = min(context_limit, max_cache_tokens)
+        app.state.cache = SlotCache(model, batch_size, cache_tokens_per_slot)
         app.state.gpu_memory = TorchMemoryMetrics(model.device)
         gpu_uuid = None
         if model.device.type == "cuda":
@@ -136,6 +139,8 @@ def create_app(
                 "max_batched_tokens": max_batched_tokens,
                 "max_context_tokens": context_limit,
                 "max_cache_tokens": max_cache_tokens,
+                "cache_layout": "fixed_slots",
+                "cache_tokens_per_slot": cache_tokens_per_slot,
                 "profile_enabled": profile,
             },
         }
@@ -151,6 +156,7 @@ def create_app(
                 await worker
             except asyncio.CancelledError:
                 pass
+            del app.state.cache
             del app.state.model
             del app.state.tokenizer
 

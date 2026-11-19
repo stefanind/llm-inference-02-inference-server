@@ -77,7 +77,7 @@ class ActiveRequest:
     started_at: float | None = None
     batch_size: int = 0
     response: dict | None = None
-    # Tokenize once before queueing; only admitted requests build a GPU cache.
+    # Tokenize once before queueing; only admitted requests get a cache slot.
     prompt_token_ids: list[int] | None = None
     reserved_cache_tokens: int = 0
     prefill_tokens: int = 0  # Prompt tokens already processed by the model.
@@ -86,7 +86,13 @@ class ActiveRequest:
     text_delta: str = ""  # Prepared in the GPU thread, published by the async worker.
     generation_started_at: float | None = None
     first_token_at: float | None = None
-    kv_cache: object | None = None
+    cache_slot: int | None = None
+    cache_length: int = 0
+
+    def release_cache_slot(self):
+        # The next occupant starts with an empty history in the same buffer.
+        self.cache_slot = None
+        self.cache_length = 0
 
 
 def schedule_step(active, max_batched_tokens):
@@ -122,7 +128,7 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
         remaining = []
         for job in active:
             if job.cancelled:
-                job.kv_cache = None
+                job.release_cache_slot()
                 queue.task_done()
             else:
                 remaining.append(job)
@@ -148,7 +154,10 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
         # Reservations belong to active requests. Removing a finished, failed,
         # or cancelled request releases its reservation on the next iteration.
         reserved_tokens = sum(job.reserved_cache_tokens for job in active)
-        while waiting and len(active) < batch_size:
+        free_slots = list(range(batch_size))
+        for job in active:
+            free_slots.remove(job.cache_slot)
+        while waiting and free_slots:
             job = waiting[0]
             if reserved_tokens + job.reserved_cache_tokens > requests.max_cache_tokens:
                 # Preserve FIFO: smaller requests behind this one also wait.
@@ -157,6 +166,7 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
             waiting.pop(0)
             requests.waiting -= 1
             reserved_tokens += job.reserved_cache_tokens
+            job.cache_slot = free_slots.pop(0)
             active.append(job)
         requests.metrics.record_queue(requests.waiting)
         requests.metrics.record_active(len(active), reserved_tokens)
@@ -175,7 +185,7 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
         except Exception as error:
             # A failed step releases its callers; the worker can serve new work.
             for job in active:
-                job.kv_cache = None
+                job.release_cache_slot()
                 if not job.cancelled:
                     job.events.put_nowait({"type": "error", "error": str(error)})
                 queue.task_done()
@@ -186,7 +196,7 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
         remaining = []
         for job in active:
             if job.cancelled:
-                job.kv_cache = None
+                job.release_cache_slot()
                 queue.task_done()
                 continue
             if job.text_delta:
@@ -198,7 +208,7 @@ async def run_worker(requests, step, batch_size=4, batch_wait_ms=10):
             job.response["queue_wait_ms"] = elapsed_ms(job.enqueued_at, job.started_at)
             job.response["batch_size"] = job.batch_size
             job.response["type"] = "done"
-            job.kv_cache = None
+            job.release_cache_slot()
             job.events.put_nowait(job.response)
             queue.task_done()
         active = remaining

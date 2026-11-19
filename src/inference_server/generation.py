@@ -1,11 +1,10 @@
-"""Token sampling and continuous generation with per-request KV caches."""
+"""Token sampling and continuous generation with fixed KV cache slots."""
 
 import time
 from typing import Optional
 
 import torch
 
-from inference_server.cache import combine_caches, save_caches
 from inference_server.engine import schedule_step
 
 
@@ -56,35 +55,15 @@ def select_next_token(
     return torch.multinomial(probabilities, num_samples=1)
 
 
-def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
-    """Process prompt chunks or decode tokens, reusing each request's history."""
+def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
+    """Process new tokens and append their keys and values to the slot cache."""
     profile = metrics is not None and metrics.profile_enabled
     if profile:
         started_at = profile_time(model.device)
 
-    cache, past_width = combine_caches(jobs)
-    # Left-pad histories and new inputs separately. Position IDs count only
-    # real tokens, so a resumed prompt keeps the same positions as a whole one.
-    width = max(len(sequence) for sequence in sequences)
-    input_ids = []
-    masks = []
-    positions = []
-    for job, sequence in zip(jobs, sequences):
-        past_length = 0
-        if job.kv_cache is not None:
-            past_length = job.kv_cache[0][0].shape[2]
-        padding = width - len(sequence)
-        input_ids.append([tokenizer.pad_token_id] * padding + sequence)
-        masks.append(
-            [0] * (past_width - past_length) + [1] * past_length
-            + [0] * padding + [1] * len(sequence)
-        )
-        positions.append(
-            [0] * padding + list(range(past_length, past_length + len(sequence)))
-        )
-    input_ids = torch.tensor(input_ids, dtype=torch.long, device=model.device)
-    attention_mask = torch.tensor(masks, dtype=torch.long, device=model.device)
-    position_ids = torch.tensor(positions, dtype=torch.long, device=model.device)
+    input_ids, position_ids, attention_mask, output_rows = cache.prepare(
+        jobs, sequences, tokenizer.pad_token_id,
+    )
     if profile:
         started_at = finish_timing(metrics, phase, "batch_setup", started_at, model.device)
 
@@ -98,30 +77,33 @@ def forward_tokens(jobs, sequences, model, tokenizer, metrics, phase):
         use_cache=True,
     )
     if profile:
-        started_at = finish_timing(metrics, phase, "model_forward", started_at, model.device)
+        finish_timing(metrics, phase, "model_forward", started_at, model.device)
 
-    save_caches(jobs, outputs.past_key_values, past_width, [len(sequence) for sequence in sequences])
-    if profile:
-        finish_timing(metrics, phase, "cache_save", started_at, model.device)
-    return outputs.logits[:, -1, :]
+    # Each layer has already written its new tokens. Advance the logical
+    # lengths only after the whole forward succeeds.
+    for job, sequence in zip(jobs, sequences):
+        job.cache_length += len(sequence)
+    if output_rows == list(range(input_ids.shape[0])):
+        return outputs.logits[:, -1, :]
+    return outputs.logits[output_rows, -1, :]
 
 
-def prefill(jobs, chunk_lengths, model, tokenizer, metrics=None):
+def prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics):
     """Process just the scheduled part of each prompt and remember our progress."""
     sequences = []
     for job, length in zip(jobs, chunk_lengths):
         start = job.prefill_tokens
         sequences.append(job.prompt_token_ids[start:start + length])
-    logits = forward_tokens(jobs, sequences, model, tokenizer, metrics, "prefill")
+    logits = forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, "prefill")
     for job, length in zip(jobs, chunk_lengths):
         job.prefill_tokens += length
     return logits
 
 
-def decode(jobs, model, tokenizer, metrics=None):
+def decode(jobs, model, tokenizer, cache, metrics):
     """Process only each request's newest token using its cached history."""
     sequences = [[job.token_ids[-1]] for job in jobs]
-    return forward_tokens(jobs, sequences, model, tokenizer, metrics, "decode")
+    return forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, "decode")
 
 
 def finish_step(jobs, logits, tokenizer, stop_token_ids):
@@ -150,7 +132,7 @@ def finish_step(jobs, logits, tokenizer, stop_token_ids):
 
 
 @torch.inference_mode()
-def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None):
+def generate_step(active, model, tokenizer, cache, max_batched_tokens=512, metrics=None):
     """Decode first, then process prompt chunks within the remaining budget."""
     profile = metrics is not None and metrics.profile_enabled
     # Qwen3 declares two end tokens. The tokenizer only names the primary one.
@@ -165,7 +147,7 @@ def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None
     # Keep these as separate forward passes. A long prefill yields to decode
     # again on the next scheduler iteration instead of running to completion.
     if decoding:
-        logits = decode(decoding, model, tokenizer, metrics)
+        logits = decode(decoding, model, tokenizer, cache, metrics)
         if profile:
             started_at = profile_time(model.device)
         finish_step(decoding, logits, tokenizer, stop_token_ids)
@@ -174,7 +156,7 @@ def generate_step(active, model, tokenizer, max_batched_tokens=512, metrics=None
     if chunks:
         jobs = [job for job, length in chunks]
         chunk_lengths = [length for job, length in chunks]
-        logits = prefill(jobs, chunk_lengths, model, tokenizer, metrics)
+        logits = prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics)
         if profile:
             started_at = profile_time(model.device)
         for index, job in enumerate(jobs):

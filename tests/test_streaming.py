@@ -15,7 +15,6 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         async def step(active):
             for job in active:
                 if job.request.prompt == "first":
-                    job.kv_cache = object()
                     if not job.token_ids:
                         job.token_ids.append(1)
                         job.text_delta = "hello"
@@ -44,12 +43,13 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(text_received.wait(), timeout=2)
             self.assertIsNone(first.response)
+            self.assertEqual(first.cache_slot, 0)
             disconnected.set()
             await asyncio.wait_for(sending, timeout=2)
             done = await asyncio.wait_for(second.events.get(), timeout=2)
             self.assertEqual(done["type"], "done")
             self.assertTrue(first.cancelled)
-            self.assertIsNone(first.kv_cache)
+            self.assertIsNone(first.cache_slot)
             await asyncio.wait_for(queue.queue.join(), timeout=2)
 
             # A socket can fail before the event generator has even started.

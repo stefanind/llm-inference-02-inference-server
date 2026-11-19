@@ -95,6 +95,7 @@ class EngineMetrics:
                 self.profile[phase] = {
                     "batch_setup": {"calls": 0, "total_ms": 0.0},
                     "model_forward": {"calls": 0, "total_ms": 0.0},
+                    # Keep this stage for comparison with earlier profiles.
                     "cache_save": {"calls": 0, "total_ms": 0.0},
                     "token_handling": {"calls": 0, "total_ms": 0.0},
                 }
