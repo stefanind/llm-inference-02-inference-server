@@ -94,6 +94,24 @@ boundary. That adds overhead, so measure throughput and latency with
 `--profile` off. For a before-and-after comparison, run both revisions on the
 same Pod. [PyTorch CUDA synchronization](https://docs.pytorch.org/docs/2.9/generated/torch.cuda.synchronize.html)
 
+## Trace model forward
+
+Stop the server to free the GPU. From the repo folder on the Pod, run:
+
+```bash
+HF_HOME=/workspace/hf-cache python scripts/profile_decode.py \
+  --revision 1cfa9a7208912126459214e8b04321603b3df60c
+```
+
+Look in `results/run-05/decode-trace/`. `logits-check.json` compares the
+fixed slots against plain Transformers after slot reuse and for four forced
+decode tokens. It reports score differences and top token matches. The script
+then traces eight warmed decode steps on four W2 requests. Open
+`decode-trace.json` in a Chrome trace viewer and look for `model_forward` and
+`kv_write`. `operators.txt` ranks CPU and CUDA operations across the captured
+steps. Use the normal W2/W4 runs for throughput comparisons.
+[PyTorch profiler](https://docs.pytorch.org/docs/2.9/profiler.html)
+
 ## Optional full comparison (W1–W6)
 
 Use this section to reproduce the Run 01 comparison. Stop the profiling server
