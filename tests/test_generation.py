@@ -13,9 +13,32 @@ from inference_server.decode_compile import DecodeNorms
 from inference_server.engine import ActiveRequest
 from inference_server.generation import build_response, decode, finish_step, generate_step, prefill
 from inference_server.metrics import EngineMetrics
+from scripts.profile_decode import GRAPH_CONTEXT, FixedDecodeBatch, make_job
 
 
 class GenerationTests(unittest.TestCase):
+    @torch.inference_mode()
+    def test_fixed_decode_buffers_match_regular_decode(self):
+        model, tokenizer = make_tiny_model()
+        prompts = [[1, 2], [3, 4, 5], [6, 7], [8, 9, 10]]
+        jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
+        cache = SlotCache(model, slots=4, tokens_per_slot=12)
+        prefill(jobs, [len(prompt) for prompt in prompts], model, tokenizer, cache, None)
+        fixed = FixedDecodeBatch(model, tokenizer, prompts)
+
+        # A write past all four histories must stay hidden in the fixed view.
+        tokens = torch.tensor([[11], [12], [13], [14]])
+        fixed.load_step(tokens, torch.full_like(tokens, GRAPH_CONTEXT - 1))
+        fixed.forward()
+        for step in range(3):
+            step_tokens = tokens + step
+            positions = torch.tensor([[job.cache_length] for job in jobs])
+            for job, token in zip(jobs, step_tokens.tolist()):
+                job.token_ids.extend(token)
+            fixed.load_step(step_tokens, positions)
+            expected = decode(jobs, model, tokenizer, cache, None)
+            torch.testing.assert_close(fixed.forward(), expected)
+
     @torch.inference_mode()
     def test_decode_norms_share_one_graph_and_skip_prefill(self):
         model, tokenizer = make_tiny_model()

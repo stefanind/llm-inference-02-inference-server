@@ -1,9 +1,10 @@
-"""Check Qwen3 cache logits and capture a short GPU trace of warmed W2 decode."""
+"""Trace warmed W2 decode or compare eager decode with CUDA Graph replay."""
 
 import argparse
 import json
 import time
 from pathlib import Path
+from statistics import median
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -20,6 +21,10 @@ from inference_server.workloads import make_w2
 
 WARMUP_STEPS = 4
 TRACE_STEPS = 8
+GRAPH_CONTEXT = 64
+GRAPH_STEPS = 31
+GRAPH_TRIALS = 4
+LOGIT_TOLERANCE = 0.01
 
 
 def make_job(prompt_ids, slot):
@@ -29,6 +34,158 @@ def make_job(prompt_ids, slot):
         request, started_at, prompt_token_ids=prompt_ids,
         cache_slot=slot, generation_started_at=started_at,
     )
+
+
+def make_trace_batch(tokenizer):
+    # One- and two-digit W2 user IDs give different prompt lengths on Qwen3.
+    requests = make_w2()
+    requests = requests[:2] + requests[9:11]
+    prompts = [tokenize_prompt(request.prompt, tokenizer) for request in requests]
+    return requests, prompts
+
+
+class FixedDecodeBatch:
+    """Keep the same four slots and tensor addresses for every replay."""
+
+    def __init__(self, model, tokenizer, prompts):
+        self.model = model
+        self.cache = SlotCache(model, slots=len(prompts), tokens_per_slot=GRAPH_CONTEXT)
+        jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
+        prefill(jobs, [len(prompt) for prompt in prompts], model, tokenizer, self.cache, None)
+
+        # Prepare one token per slot. All rows participate for the whole test.
+        pad = tokenizer.pad_token_id
+        self.input_ids, self.position_ids, _, _ = self.cache.prepare(jobs, [[pad] for job in jobs], pad)
+        self.cache.key_width = GRAPH_CONTEXT
+        # A view of position_ids lets the model and KV writes read the same
+        # changing positions without replacing the captured index tensor.
+        self.cache.write_positions = self.position_ids[:, 0]
+        self.key_positions = torch.arange(GRAPH_CONTEXT, device=model.device)
+        self.mask = torch.zeros((len(jobs), 1, 1, GRAPH_CONTEXT), device=model.device, dtype=model.dtype)
+
+    def load_step(self, tokens, positions):
+        self.input_ids.copy_(tokens)
+        self.position_ids.copy_(positions)
+        # Hide unwritten positions and any stale cache data beyond the query.
+        future = self.key_positions > self.position_ids[:, None, :, None]
+        self.mask.zero_().masked_fill_(future, torch.finfo(self.mask.dtype).min)
+
+    def forward(self):
+        return self.model(
+            input_ids=self.input_ids,
+            position_ids=self.position_ids,
+            attention_mask={"full_attention": self.mask},
+            past_key_values=self.cache,
+            use_cache=True,
+        ).logits[:, -1, :]
+
+
+def capture_decode_graph(eager, replay, tokens):
+    device = replay.model.device
+    # Warm and capture at the last position, beyond the measured sequence.
+    # Every position checked later still needs to be written by its own step.
+    scratch_positions = torch.full_like(tokens, GRAPH_CONTEXT - 1)
+    eager.load_step(tokens, scratch_positions)
+    replay.load_step(tokens, scratch_positions)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(WARMUP_STEPS):
+            eager.forward()
+            replay.forward()
+    torch.cuda.current_stream(device).wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        graph_logits = replay.forward()
+    return graph, graph_logits
+
+
+def check_graph_logits(eager, replay, graph, graph_logits, steps):
+    max_difference = 0.0
+    for step, (tokens, positions) in enumerate(steps, start=1):
+        eager.load_step(tokens, positions)
+        expected = eager.forward()
+        replay.load_step(tokens, positions)
+        graph.replay()
+        torch.testing.assert_close(graph_logits, expected, rtol=LOGIT_TOLERANCE, atol=LOGIT_TOLERANCE)
+        if not torch.equal(graph_logits.argmax(dim=-1), expected.argmax(dim=-1)):
+            raise RuntimeError(f"CUDA Graph and eager chose different tokens at decode step {step}.")
+        difference = (graph_logits.float() - expected.float()).abs().max().item()
+        max_difference = max(max_difference, difference)
+    return max_difference
+
+
+def time_decode(batch, forward, steps):
+    device = batch.model.device
+    torch.cuda.synchronize(device)
+    started_at = time.perf_counter()
+    for tokens, positions in steps:
+        batch.load_step(tokens, positions)
+        forward()
+        # A real decode loop needs this step's result before it can continue.
+        torch.cuda.synchronize(device)
+    return (time.perf_counter() - started_at) * 1000 / len(steps)
+
+
+@torch.inference_mode()
+def run_graph_diagnostic(model, tokenizer, output_dir):
+    requests, prompts = make_trace_batch(tokenizer)
+    prompt_lengths = [len(prompt) for prompt in prompts]
+    if max(prompt_lengths) + GRAPH_STEPS >= GRAPH_CONTEXT:
+        raise ValueError("The W2 prompts and decode steps must fit before the warmup position.")
+
+    # Separate caches prevent an eager forward from filling replay's history.
+    eager = FixedDecodeBatch(model, tokenizer, prompts)
+    replay = FixedDecodeBatch(model, tokenizer, prompts)
+    pattern = tokenizer.encode(" Explain KV caching. The tokens stay in memory.", add_special_tokens=False)
+    forced_ids = [
+        [pattern[(step + row) % len(pattern)] for row in range(len(prompts))]
+        for step in range(GRAPH_STEPS)
+    ]
+    # Stage the inputs once. Both timings include the copies into the fixed
+    # buffers and the attention mask update for each new position.
+    token_steps = torch.tensor(forced_ids, device=model.device).unsqueeze(-1)
+    start_positions = torch.tensor(prompt_lengths, device=model.device).unsqueeze(-1)
+    steps = [(token_steps[step], start_positions + step) for step in range(GRAPH_STEPS)]
+    graph, graph_logits = capture_decode_graph(eager, replay, token_steps[0])
+    max_difference = check_graph_logits(eager, replay, graph, graph_logits, steps)
+
+    modes = [("eager", eager, eager.forward), ("cuda_graph", replay, graph.replay)]
+    samples = {"eager": [], "cuda_graph": []}
+    for _ in range(GRAPH_TRIALS):
+        for name, batch, forward in modes:
+            samples[name].append(time_decode(batch, forward, steps))
+        modes.reverse()  # Alternate which mode runs first in each trial.
+    medians = {name: median(times) for name, times in samples.items()}
+
+    report = {
+        "model": model.name_or_path,
+        "revision": getattr(model.config, "_commit_hash", None),
+        "device": str(model.device),
+        "dtype": str(model.dtype),
+        "gpu_name": torch.cuda.get_device_name(model.device),
+        "gpu_uuid": str(torch.cuda.get_device_properties(model.device).uuid),
+        "torch_version": torch.__version__,
+        "compile_decode": False,
+        "w2_requests": [request.request_id for request in requests],
+        "w2_prompt_tokens": prompt_lengths,
+        "kv_positions": GRAPH_CONTEXT,
+        "warmup_eager_steps_per_cache": WARMUP_STEPS,
+        "decode_steps_per_trial": GRAPH_STEPS,
+        "forced_token_ids_by_step": forced_ids,
+        "logit_rtol": LOGIT_TOLERANCE,
+        "logit_atol": LOGIT_TOLERANCE,
+        "matching_top_tokens": len(prompts) * GRAPH_STEPS,
+        "max_abs_logit_diff": max_difference,
+        "trial_ms_per_step": samples,
+        "median_ms_per_step": medians,
+        "speedup": medians["eager"] / medians["cuda_graph"],
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "cuda-graph.json"
+    path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print(f"Saved logit checks and eager/replay timings to {path}")
 
 
 def compare_logits(model, jobs, logits, step):
@@ -128,10 +285,7 @@ def trace_decode(model, tokenizer, cache, jobs, output_dir):
 
 @torch.inference_mode()
 def run_diagnostic(model, tokenizer, output_dir):
-    # One- and two-digit W2 user IDs give different prompt lengths on Qwen3.
-    requests = make_w2()
-    requests = requests[:2] + requests[9:11]
-    prompts = [tokenize_prompt(request.prompt, tokenizer) for request in requests]
+    requests, prompts = make_trace_batch(tokenizer)
     cache = SlotCache(model, slots=4, tokens_per_slot=min(4096, model.config.max_position_embeddings))
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -163,13 +317,18 @@ def run_diagnostic(model, tokenizer, output_dir):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--revision", help="Model and tokenizer checkpoint revision")
-    parser.add_argument("--compile-decode", action="store_true", help="Compile Qwen3's decoder-layer RMSNorms during decode")
-    parser.add_argument("--output-dir", type=Path, default=Path("results/run-05/decode-trace"))
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--compile-decode", action="store_true", help="Compile Qwen3's decoder-layer RMSNorms during decode")
+    modes.add_argument("--cuda-graph", action="store_true", help="Compare eager and CUDA Graph replay for a fixed decode batch")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     model, tokenizer = load_model(revision=args.revision)
+    if args.cuda_graph:
+        run_graph_diagnostic(model, tokenizer, args.output_dir or Path("results/run-07/decode-graph"))
+        return
     if args.compile_decode:
         model.decode_norms = DecodeNorms(model)
-    run_diagnostic(model, tokenizer, args.output_dir)
+    run_diagnostic(model, tokenizer, args.output_dir or Path("results/run-05/decode-trace"))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ more in a FIFO queue. Each active request writes new tokens into its own slot.
 By default, the server allocates four 4,096-token slots at startup and limits
 total active reservations to 8,192 tokens.
 
-[Run 01 benchmark results](BENCHMARK.md) compare this server with vLLM on an RTX 3090.
+[Experiment logbook](experiment_logbook/) has one report per run, starting with the vLLM comparison.
 [How it works](HOW_IT_WORKS.md) follows a request through the source code.
 
 | Workload | What it tests |
@@ -151,6 +151,22 @@ python scripts/profile_decode.py --revision "$REVISION" \
 python scripts/profile_decode.py --revision "$REVISION" --compile-decode \
   --output-dir results/run-06/compiled/trace
 ```
+
+## Compare CUDA Graph decode
+
+Stop the server, then run this from the repo folder on the Pod.
+
+```bash
+HF_HOME=/workspace/hf-cache python scripts/profile_decode.py --cuda-graph \
+  --revision 1cfa9a7208912126459214e8b04321603b3df60c
+```
+
+The script checks logits over 31 steps on four W2 prompts using independent
+eager and replay caches. Both use a fixed 64-position KV view. The reported
+median comes from four trials per path with profiling off and includes input
+buffer copies, mask updates, and waiting for each forward to finish. The
+script stages the forced token IDs and positions on the GPU before timing.
+Results go to `results/run-07/decode-graph/cuda-graph.json`.
 
 ## Optional full comparison (W1–W6)
 
