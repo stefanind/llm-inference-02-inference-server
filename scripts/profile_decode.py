@@ -13,6 +13,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from inference_server.cache import SlotCache
 from inference_server.decode_compile import DecodeNorms
+from inference_server.decode_graph import GRAPH_CONTEXT, GRAPH_WARMUP_STEPS, FixedDecodeBatch
 from inference_server.engine import ActiveRequest
 from inference_server.generation import decode, generate_step, prefill, tokenize_prompt
 from inference_server.model import load_model
@@ -21,7 +22,6 @@ from inference_server.workloads import make_w2
 
 WARMUP_STEPS = 4
 TRACE_STEPS = 8
-GRAPH_CONTEXT = 64
 GRAPH_STEPS = 31
 GRAPH_TRIALS = 4
 LOGIT_TOLERANCE = 0.01
@@ -44,61 +44,11 @@ def make_trace_batch(tokenizer):
     return requests, prompts
 
 
-class FixedDecodeBatch:
-    """Keep the same four slots and tensor addresses for every replay."""
-
-    def __init__(self, model, tokenizer, prompts):
-        self.model = model
-        self.cache = SlotCache(model, slots=len(prompts), tokens_per_slot=GRAPH_CONTEXT)
-        jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
-        prefill(jobs, [len(prompt) for prompt in prompts], model, tokenizer, self.cache, None)
-
-        # Prepare one token per slot. All rows participate for the whole test.
-        pad = tokenizer.pad_token_id
-        self.input_ids, self.position_ids, _, _ = self.cache.prepare(jobs, [[pad] for job in jobs], pad)
-        self.cache.key_width = GRAPH_CONTEXT
-        # A view of position_ids lets the model and KV writes read the same
-        # changing positions without replacing the captured index tensor.
-        self.cache.write_positions = self.position_ids[:, 0]
-        self.key_positions = torch.arange(GRAPH_CONTEXT, device=model.device)
-        self.mask = torch.zeros((len(jobs), 1, 1, GRAPH_CONTEXT), device=model.device, dtype=model.dtype)
-
-    def load_step(self, tokens, positions):
-        self.input_ids.copy_(tokens)
-        self.position_ids.copy_(positions)
-        # Hide unwritten positions and any stale cache data beyond the query.
-        future = self.key_positions > self.position_ids[:, None, :, None]
-        self.mask.zero_().masked_fill_(future, torch.finfo(self.mask.dtype).min)
-
-    def forward(self):
-        return self.model(
-            input_ids=self.input_ids,
-            position_ids=self.position_ids,
-            attention_mask={"full_attention": self.mask},
-            past_key_values=self.cache,
-            use_cache=True,
-        ).logits[:, -1, :]
-
-
-def capture_decode_graph(eager, replay, tokens):
-    device = replay.model.device
-    # Warm and capture at the last position, beyond the measured sequence.
-    # Every position checked later still needs to be written by its own step.
-    scratch_positions = torch.full_like(tokens, GRAPH_CONTEXT - 1)
-    eager.load_step(tokens, scratch_positions)
-    replay.load_step(tokens, scratch_positions)
-    stream = torch.cuda.Stream(device=device)
-    stream.wait_stream(torch.cuda.current_stream(device))
-    with torch.cuda.stream(stream):
-        for _ in range(WARMUP_STEPS):
-            eager.forward()
-            replay.forward()
-    torch.cuda.current_stream(device).wait_stream(stream)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        graph_logits = replay.forward()
-    return graph, graph_logits
+def make_prefilled_batch(model, tokenizer, prompts):
+    cache = SlotCache(model, slots=len(prompts), tokens_per_slot=GRAPH_CONTEXT)
+    jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
+    prefill(jobs, [len(prompt) for prompt in prompts], model, tokenizer, cache, None)
+    return FixedDecodeBatch(model, cache)
 
 
 def check_graph_logits(eager, replay, graph, graph_logits, steps):
@@ -136,8 +86,8 @@ def run_graph_diagnostic(model, tokenizer, output_dir):
         raise ValueError("The W2 prompts and decode steps must fit before the warmup position.")
 
     # Separate caches prevent an eager forward from filling replay's history.
-    eager = FixedDecodeBatch(model, tokenizer, prompts)
-    replay = FixedDecodeBatch(model, tokenizer, prompts)
+    eager = make_prefilled_batch(model, tokenizer, prompts)
+    replay = make_prefilled_batch(model, tokenizer, prompts)
     pattern = tokenizer.encode(" Explain KV caching. The tokens stay in memory.", add_special_tokens=False)
     forced_ids = [
         [pattern[(step + row) % len(pattern)] for row in range(len(prompts))]
@@ -148,7 +98,11 @@ def run_graph_diagnostic(model, tokenizer, output_dir):
     token_steps = torch.tensor(forced_ids, device=model.device).unsqueeze(-1)
     start_positions = torch.tensor(prompt_lengths, device=model.device).unsqueeze(-1)
     steps = [(token_steps[step], start_positions + step) for step in range(GRAPH_STEPS)]
-    graph, graph_logits = capture_decode_graph(eager, replay, token_steps[0])
+    # Warm up beyond the measured history so every checked position is fresh.
+    eager.load_step(token_steps[0], torch.full_like(token_steps[0], GRAPH_CONTEXT - 1))
+    for _ in range(GRAPH_WARMUP_STEPS):
+        eager.forward()
+    graph, graph_logits = replay.capture(token_steps[0])
     max_difference = check_graph_logits(eager, replay, graph, graph_logits, steps)
 
     modes = [("eager", eager, eager.forward), ("cuda_graph", replay, graph.replay)]
@@ -171,7 +125,7 @@ def run_graph_diagnostic(model, tokenizer, output_dir):
         "w2_requests": [request.request_id for request in requests],
         "w2_prompt_tokens": prompt_lengths,
         "kv_positions": GRAPH_CONTEXT,
-        "warmup_eager_steps_per_cache": WARMUP_STEPS,
+        "warmup_eager_steps_per_cache": GRAPH_WARMUP_STEPS,
         "decode_steps_per_trial": GRAPH_STEPS,
         "forced_token_ids_by_step": forced_ids,
         "logit_rtol": LOGIT_TOLERANCE,

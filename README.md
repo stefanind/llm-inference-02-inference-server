@@ -168,6 +168,52 @@ buffer copies, mask updates, and waiting for each forward to finish. The
 script stages the forced token IDs and positions on the GPU before timing.
 Results go to `results/run-07/decode-graph/cuda-graph.json`.
 
+## Measure CUDA Graph serving
+
+For Run 08, start the eager server first. After its W2 trials, stop it and
+start the graph server on the same Pod and revision.
+
+```bash
+python -m inference_server.cli --host 127.0.0.1 --revision "$REVISION"
+python -m inference_server.cli --host 127.0.0.1 --revision "$REVISION" --cuda-graph-decode
+```
+
+In the client terminal, run this block for each server. Set `mode=graph` on
+the second pass. The warmup checks the running server's flag before timing.
+
+```bash
+(
+  set -e
+  mode=eager
+  out="results/run-08/$mode"
+  mkdir -p "$out"
+  python -m inference_server.cli run W2 --timeout 300 > "$out/warmup.json"
+  python - "$out/warmup.json" "$mode" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    report = json.load(file)
+settings = report["run_info"]["server"]["settings"]
+assert settings["cuda_graph_decode"] == (sys.argv[2] == "graph"), "Check the server flag and client mode"
+assert not settings["profile_enabled"] and not settings["compile_decode"]
+assert report["summary"]["successful_requests"] == 20
+if settings["cuda_graph_decode"]:
+    assert report["engine_metrics"]["decode_graph_replay_count"] > 0
+PY
+  for trial in 1 2 3; do
+    python -m inference_server.cli run W2 --timeout 300 > "$out/W2-$trial.json"
+  done
+)
+```
+
+Check completion and output token counts, then compare median
+`summary.output_tokens_per_second` and `summary.average_generation_tpot_ms`.
+`engine_metrics.decode_graph_replay_fraction` gives the share of decode
+steps that used replay. Four-request batches with histories that fit the
+64-position view can replay. Prefill, smaller batches, and longer histories
+run eager.
+
 ## Optional full comparison (W1–W6)
 
 Use this section to reproduce the Run 01 comparison. Stop the profiling server

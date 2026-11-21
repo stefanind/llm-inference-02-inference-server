@@ -86,6 +86,7 @@ class EngineMetrics:
     decode_batch_total: int = 0
     peak_decode_batch_size: int = 0
     profile_enabled: bool = False
+    decode_graph_replay_count: int = 0
     profile: dict | None = field(init=False, default=None)
 
     def __post_init__(self):
@@ -116,7 +117,7 @@ class EngineMetrics:
         self.peak_active_requests = max(self.peak_active_requests, active)
         self.peak_reserved_cache_tokens = max(self.peak_reserved_cache_tokens, reserved)
 
-    def record_forward(self, phase, size):
+    def record_forward(self, phase, size, graph_replay=False):
         """Count real requests in each prefill or decode forward."""
         if phase == "prefill":
             self.prefill_forward_count += 1
@@ -124,6 +125,8 @@ class EngineMetrics:
             self.peak_prefill_batch_size = max(self.peak_prefill_batch_size, size)
         else:
             self.decode_forward_count += 1
+            if graph_replay:
+                self.decode_graph_replay_count += 1
             self.decode_batch_total += size
             self.peak_decode_batch_size = max(self.peak_decode_batch_size, size)
 
@@ -139,6 +142,8 @@ class EngineMetrics:
             "mean_prefill_batch_size": self.prefill_batch_total / self.prefill_forward_count if self.prefill_forward_count else None,
             "peak_prefill_batch_size": self.peak_prefill_batch_size,
             "decode_forward_count": self.decode_forward_count,
+            "decode_graph_replay_count": self.decode_graph_replay_count,
+            "decode_graph_replay_fraction": self.decode_graph_replay_count / self.decode_forward_count if self.decode_forward_count else None,
             "mean_decode_batch_size": self.decode_batch_total / self.decode_forward_count if self.decode_forward_count else None,
             "peak_decode_batch_size": self.peak_decode_batch_size,
             # Take a copy for readers while the worker continues to record.

@@ -57,34 +57,41 @@ def select_next_token(
     return torch.multinomial(probabilities, num_samples=1)
 
 
-def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
+def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase, decode_graph=None):
     """Process new tokens and append their keys and values to the slot cache."""
     profile = metrics is not None and metrics.profile_enabled
     if profile:
         started_at = profile_time(model.device)
 
-    input_ids, position_ids, attention_mask, output_rows = cache.prepare(
-        jobs, sequences, tokenizer.pad_token_id,
-    )
+    if decode_graph is None:
+        input_ids, position_ids, attention_mask, output_rows = cache.prepare(
+            jobs, sequences, tokenizer.pad_token_id,
+        )
+    else:
+        output_rows = decode_graph.prepare(jobs, sequences)
     if profile:
         started_at = finish_timing(metrics, phase, "batch_setup", started_at, model.device)
 
     if metrics is not None:
-        metrics.record_forward(phase, len(jobs))
+        metrics.record_forward(phase, len(jobs), graph_replay=decode_graph is not None)
     # Model forward: score the next token. Inside each attention layer, Qwen3
     # calls SlotCache.update() to write new keys and values into the slot.
-    inputs = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-        "past_key_values": cache,
-        "use_cache": True,
-    }
-    decode_norms = getattr(model, "decode_norms", None)
-    if phase == "decode" and decode_norms is not None:
-        outputs = decode_norms.run_decode(model, **inputs)
+    if decode_graph is not None:
+        logits = decode_graph.replay()
     else:
-        outputs = model(**inputs)
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": cache,
+            "use_cache": True,
+        }
+        decode_norms = getattr(model, "decode_norms", None)
+        if phase == "decode" and decode_norms is not None:
+            outputs = decode_norms.run_decode(model, **inputs)
+        else:
+            outputs = model(**inputs)
+        logits = outputs.logits[:, -1, :]
     if profile:
         finish_timing(metrics, phase, "model_forward", started_at, model.device)
 
@@ -94,9 +101,9 @@ def forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, phase):
         job.cache_length += len(sequence)
     # The last input position predicts the next token. Return rows in request
     # order, skipping any empty slots that were padded into the batch.
-    if output_rows == list(range(input_ids.shape[0])):
-        return outputs.logits[:, -1, :]
-    return outputs.logits[output_rows, -1, :]
+    if output_rows == list(range(logits.shape[0])):
+        return logits
+    return logits[output_rows]
 
 
 def prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics):
@@ -111,10 +118,12 @@ def prefill(jobs, chunk_lengths, model, tokenizer, cache, metrics):
     return logits
 
 
-def decode(jobs, model, tokenizer, cache, metrics):
+def decode(jobs, model, tokenizer, cache, metrics, decode_graph=None):
     """Autoregressive decode: feed the last generated token and reuse its history."""
     sequences = [[job.token_ids[-1]] for job in jobs]
-    return forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, "decode")
+    if decode_graph is not None and not decode_graph.can_replay(jobs):
+        decode_graph = None
+    return forward_tokens(jobs, sequences, model, tokenizer, cache, metrics, "decode", decode_graph)
 
 
 def finish_step(jobs, logits, tokenizer, stop_token_ids):
@@ -147,7 +156,7 @@ def finish_step(jobs, logits, tokenizer, stop_token_ids):
 
 # Inference mode keeps PyTorch from recording gradients in the serving loop.
 @torch.inference_mode()
-def generate_step(active, model, tokenizer, cache, max_batched_tokens=512, metrics=None):
+def generate_step(active, model, tokenizer, cache, max_batched_tokens=512, metrics=None, decode_graph=None):
     """Decode first, then process prompt chunks within the remaining budget."""
     profile = metrics is not None and metrics.profile_enabled
     # Qwen3 declares two end tokens. The tokenizer only names the primary one.
@@ -162,7 +171,7 @@ def generate_step(active, model, tokenizer, cache, max_batched_tokens=512, metri
     # Keep these as separate forward passes. A long prefill yields to decode
     # again on the next scheduler iteration instead of running to completion.
     if decoding:
-        logits = decode(decoding, model, tokenizer, cache, metrics)
+        logits = decode(decoding, model, tokenizer, cache, metrics, decode_graph)
         if profile:
             started_at = profile_time(model.device)
         finish_step(decoding, logits, tokenizer, stop_token_ids)

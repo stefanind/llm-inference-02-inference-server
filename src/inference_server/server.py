@@ -12,6 +12,7 @@ import torch
 
 from inference_server.cache import SlotCache
 from inference_server.decode_compile import DecodeNorms
+from inference_server.decode_graph import GRAPH_BATCH_SIZE, DecodeGraph
 from inference_server.engine import RequestQueue, RequestTooLarge, run_worker, submit_request
 from inference_server.generation import generate_step, tokenize_prompt
 from inference_server.gpu_metrics import TorchMemoryMetrics
@@ -76,13 +77,17 @@ def stream_response(job, request):
 def create_app(
     queue_capacity=20, batch_size=4, batch_wait_ms=10, max_batched_tokens=512,
     max_context_tokens=4096, max_cache_tokens=8192,
-    revision=None, profile=False, compile_decode=False,
+    revision=None, profile=False, compile_decode=False, cuda_graph_decode=False,
 ):
     """Build the GPU inference server. Load one BF16 model during startup."""
     if queue_capacity <= 0:
         raise ValueError("queue_capacity must be positive")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if cuda_graph_decode and batch_size != GRAPH_BATCH_SIZE:
+        raise ValueError(f"--cuda-graph-decode requires --batch-size {GRAPH_BATCH_SIZE}")
+    if cuda_graph_decode and compile_decode:
+        raise ValueError("--cuda-graph-decode and --compile-decode are separate modes")
     if max_batched_tokens < batch_size:
         raise ValueError("max_batched_tokens must be at least batch_size so every decode can advance")
     if not math.isfinite(batch_wait_ms) or batch_wait_ms < 0:
@@ -97,7 +102,7 @@ def create_app(
         # can accept requests and deliver text while the model runs.
         await asyncio.to_thread(
             generate_step, active, app.state.model, app.state.tokenizer, app.state.cache,
-            max_batched_tokens, app.state.requests.metrics,
+            max_batched_tokens, app.state.requests.metrics, app.state.decode_graph,
         )
 
     @asynccontextmanager
@@ -117,6 +122,9 @@ def create_app(
         # The shared admission budget separately limits active reservations.
         cache_tokens_per_slot = min(context_limit, max_cache_tokens)
         app.state.cache = SlotCache(model, batch_size, cache_tokens_per_slot)
+        app.state.decode_graph = None
+        if cuda_graph_decode:
+            app.state.decode_graph = DecodeGraph(model, app.state.cache, app.state.tokenizer.pad_token_id)
         app.state.gpu_memory = TorchMemoryMetrics(model.device)
         gpu_uuid = None
         if model.device.type == "cuda":
@@ -149,6 +157,8 @@ def create_app(
                 "cache_tokens_per_slot": cache_tokens_per_slot,
                 "profile_enabled": profile,
                 "compile_decode": compile_decode,
+                "cuda_graph_decode": cuda_graph_decode,
+                "cuda_graph_context_tokens": app.state.decode_graph.batch.context_tokens if cuda_graph_decode else None,
             },
         }
         print(f"Context limit: {context_limit} tokens; cache budget: {max_cache_tokens} tokens", flush=True)
@@ -163,6 +173,7 @@ def create_app(
                 await worker
             except asyncio.CancelledError:
                 pass
+            del app.state.decode_graph
             del app.state.cache
             del app.state.model
             del app.state.tokenizer

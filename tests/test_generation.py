@@ -10,34 +10,54 @@ from tiny_model import make_tiny_model
 
 from inference_server.cache import SlotCache
 from inference_server.decode_compile import DecodeNorms
+from inference_server.decode_graph import DecodeGraph, FixedDecodeBatch
 from inference_server.engine import ActiveRequest
 from inference_server.generation import build_response, decode, finish_step, generate_step, prefill
 from inference_server.metrics import EngineMetrics
-from scripts.profile_decode import GRAPH_CONTEXT, FixedDecodeBatch, make_job
+from scripts.profile_decode import make_job
 
 
 class GenerationTests(unittest.TestCase):
     @torch.inference_mode()
-    def test_fixed_decode_buffers_match_regular_decode(self):
+    def test_graph_decode_shares_history_with_eager(self):
         model, tokenizer = make_tiny_model()
-        prompts = [[1, 2], [3, 4, 5], [6, 7], [8, 9, 10]]
+        cache = SlotCache(model, slots=4, tokens_per_slot=96)
+        reference_cache = SlotCache(model, slots=4, tokens_per_slot=96)
+        prompts = [[1, 2, 3], [4, 5], [6, 7], [8] * 62]
         jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
-        cache = SlotCache(model, slots=4, tokens_per_slot=12)
-        prefill(jobs, [len(prompt) for prompt in prompts], model, tokenizer, cache, None)
-        fixed = FixedDecodeBatch(model, tokenizer, prompts)
+        reference_jobs = [make_job(prompt, slot) for slot, prompt in enumerate(prompts)]
+        metrics = EngineMetrics()
 
-        # A write past all four histories must stay hidden in the fixed view.
-        tokens = torch.tensor([[11], [12], [13], [14]])
-        fixed.load_step(tokens, torch.full_like(tokens, GRAPH_CONTEXT - 1))
-        fixed.forward()
-        for step in range(3):
-            step_tokens = tokens + step
-            positions = torch.tensor([[job.cache_length] for job in jobs])
-            for job, token in zip(jobs, step_tokens.tolist()):
-                job.token_ids.extend(token)
-            fixed.load_step(step_tokens, positions)
-            expected = decode(jobs, model, tokenizer, cache, None)
-            torch.testing.assert_close(fixed.forward(), expected)
+        def capture_on_cpu(batch, tokens):
+            # Use the fixed forward on CPU as a stand-in for actual capture.
+            batch.load_step(tokens, torch.full_like(tokens, batch.context_tokens - 1))
+            logits = batch.forward()
+            return SimpleNamespace(replay=lambda: logits.copy_(batch.forward())), logits
+
+        with patch.object(FixedDecodeBatch, "capture", capture_on_cpu):
+            graph = DecodeGraph(model, cache, tokenizer.pad_token_id)
+        lengths = [len(prompt) for prompt in prompts]
+        prefill(jobs, lengths, model, tokenizer, cache, metrics)
+        prefill(reference_jobs, lengths, model, tokenizer, reference_cache, None)
+
+        # Partial batch, then full batches in scheduler order. On the final
+        # step slot 3 has reached position 64 and brings the batch back to eager.
+        for step, slots in enumerate(([0], [3, 1, 2, 0], [3, 2, 0, 1], [0, 1, 2, 3])):
+            if step == 2:
+                # Reuse slot 0 with a shorter prompt while its old KV remains.
+                jobs[0] = make_job([9], 0)
+                reference_jobs[0] = make_job([9], 0)
+                prefill([jobs[0]], [1], model, tokenizer, cache, metrics)
+                prefill([reference_jobs[0]], [1], model, tokenizer, reference_cache, None)
+            for slot in slots:
+                token = 10 + step + slot
+                jobs[slot].token_ids.append(token)
+                reference_jobs[slot].token_ids.append(token)
+            actual = decode([jobs[slot] for slot in slots], model, tokenizer, cache, metrics, graph)
+            expected = decode([reference_jobs[slot] for slot in slots], model, tokenizer, reference_cache, None)
+            torch.testing.assert_close(actual, expected)
+
+        self.assertEqual(metrics.snapshot()["decode_graph_replay_fraction"], 0.5)
 
     @torch.inference_mode()
     def test_decode_norms_share_one_graph_and_skip_prefill(self):
