@@ -14,7 +14,7 @@ and 4,096-token context limit. The vLLM startup log records chunked prefill,
 Inductor compilation, and CUDA Graphs enabled, with prefix caching off.
 I warmed up with W2 and measured each case once with profiling off.
 W3 used seed 42, W5 sent a burst of 400 requests, and each W6 arrival window
-lasted 30 seconds. [Workload definitions and run commands](../README.md)
+lasted 30 seconds. [Workload definitions and run commands](../docs/experiments.md#workloads)
 
 ## Results
 
